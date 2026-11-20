@@ -1,0 +1,119 @@
+   cut = tl.where(reach, trial, cut)
+        least = cut.to(tl.int32, bitcast=True) ^ -(2**31)
+        # The cut's class and key, for _emit_kernel to compare raw scores against
+        tl.store(STATE + 6 * n_rows + index, least >> 16, mask=collected)
+        tl.store(STATE + 7 * n_rows + index, least & 0xFFFF, mask=collected)
+
+
+# Passes launched one per kernel over the rows still open, before one that loops to the end
+FIXED_PASSES = 2
+
+
+def _select(
+    index_queries: torch.Tensor,
+    index_keys: torch.Tensor,
+    window_size: int,
+    sink_size: int,
+    top_k: int,
+    scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select the long-range keys each query keeps, by the passes of the module's search.
+
+    Args:
+        index_queries: Head-major indexer queries [b, h_sel, t, d_r].
+        index_keys: Indexer keys [b, h_k, t, d_r].
+        window_size: Recent keys each query keeps by position.
+        sink_size: First keys each query keeps by position.
+        top_k: Long-range keys each query keeps.
+        scale: The factor scores are scaled by before rounding.
+
+    Returns:
+        The bitmask [b, h_sel, t, w] int32.
+        The occupancy [b, h_sel, n, n] int32.
+    """
+    b, h_sel, t, d_r = index_queries.shape
+    low, high = order_range(index_queries.dtype)
+    n = occupancy_size(t)
+    device = index_queries.device
+    bits = torch.zeros(b, h_sel, t, words_per_row(t), dtype=torch.int32, device=device)
+    occupancy = torch.zeros(b, h_sel, n, n, dtype=torch.int32, device=device)
+    rows = b * h_sel * t
+    state = torch.empty(9, rows, dtype=torch.int32, device=device)
+    buf = torch.empty(rows, CAP, dtype=torch.int32, device=device)
+    listed = torch.empty(b * h_sel, t, dtype=torch.int32, device=device)
+    counts = torch.empty(b * h_sel, dtype=torch.int32, device=device)
+    index_queries = index_queries if index_queries.stride(-1) == 1 else index_queries.contiguous()
+    index_keys = index_keys if index_keys.stride(-1) == 1 else index_keys.contiguous()
+    table = boundary_table(scale, index_queries.dtype, device)
+    grid = (triton.cdiv(t, 64), b * h_sel)
+    strides = (
+        index_queries.stride(0), index_queries.stride(2), index_queries.stride(1),
+        index_keys.stride(0), index_keys.stride(2), index_keys.stride(1),
+    )  # fmt: skip
+    shape = dict(
+        KV_GROUP=h_sel // index_keys.shape[1], WINDOW=window_size, SINK=sink_size, D_R=d_r,
+        BLOCK_DR=max(16, triton.next_power_of_2(d_r)),
+    )  # fmt: skip
+    rank = tl.bfloat16 if index_queries.dtype == torch.bfloat16 else tl.float16
+    _stats_kernel[grid](
+        index_queries, index_keys, state, *strides, t, top_k, h_sel, ORDER_LO=low, ORDER_HI=high,
+        HALF_SIGMAS=HALF_SIGMAS, HALF_MIN=HALF_MIN, **shape, num_warps=4, num_stages=2,
+    )  # fmt: skip
+    for p in range(FIXED_PASSES + 1):
+        _compact_kernel[(b * h_sel,)](
+            state, listed, counts, t, top_k, WINDOW=window_size, SINK=sink_size, CHUNK=1024, num_warps=4
+        )
+        _pass_kernel[grid](
+            index_queries, index_keys, table, state, listed, counts, *strides, t, scale, top_k,
+            h_sel, p, CAP=CAP, VALUE_PASSES=VALUE_PASSES, MAX_PASSES=MAX_PASSES,
+            LOOP=p == FIXED_PASSES, RANK=rank, ORDER_LO=low, **shape, num_warps=4, num_stages=2,
+        )  # fmt: skip
+        _collect_kernel[grid](
+            index_queries, index_keys, state, listed, counts, buf, *strides, t, scale, h_sel, CAP=CAP,
+            RANK=rank, **shape, num_warps=4, num_stages=2,
+        )  # fmt: skip
+    _resolve_kernel[grid](state, buf, t, scale, top_k, CAP=CAP, RANK=rank, num_warps=4)
+    _emit_kernel[grid](
+        index_queries, index_keys, table, state, bits, occupancy, *strides,
+        bits.stride(0), bits.stride(1), bits.stride(2),
+        occupancy.stride(0), occupancy.stride(1), occupancy.stride(2),
+        t, top_k, h_sel, ORDER_LO=low, **shape, num_warps=4, num_stages=2,
+    )  # fmt: skip
+    return bits, occupancy
+
+
+@torch.library.custom_op("lsa::dsa_sparse_select", mutates_args=())
+def select_op(
+    index_queries: torch.Tensor,
+    index_keys: torch.Tensor,
+    window_size: int,
+    sink_size: int,
+    top_k: int,
+    scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select the Selection of head-major indexer queries over keys.
+
+    Args:
+        index_queries: Head-major indexer queries [b, h_sel, t, d_r].
+        index_keys: Indexer keys [b, h_k, t, d_r].
+
+    Returns:
+        The Selection's bits and occupancy.
+    """
+    return _select(index_queries, index_keys, window_size, sink_size, top_k, scale)
+
+
+@select_op.register_fake
+def _(
+    index_queries: torch.Tensor,
+    index_keys: torch.Tensor,
+    window_size: int,
+    sink_size: int,
+    top_k: int,
+    scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return empty tensors shaped as the bitmask and occupancy."""
+    b, h_sel, t, _ = index_queries.shape
+    n = occupancy_size(t)
+    bits = index_queries.new_empty((b, h_sel, t, words_per_row(t)), dtype=torch.int32)
+    return bits, index_queries.new_empty((b, h_sel, n, n), dtype=torch.int32)
