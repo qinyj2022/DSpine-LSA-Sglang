@@ -1,0 +1,55 @@
+﻿VERSION: v2.0-fp16
+TAG: v2.0-fp16-qwen38-lsa-dspine
+NAME: Qwen3.8-27B LSA + DSpine 部署 — V2.0-FP16（bf16 权重）
+CREATED: 2026-11-19
+STATUS: 生产可用（采样请求稳定 / verify CUDA graph / 并发已验证）
+PARENT: v1.1-lsa-dspine-graph
+
+RELEASE_DIR: releases/v2.0-fp16-qwen38-lsa-dspine/         1707 files  18.2 MB
+TARBALL: releases/v2.0-fp16-qwen38-lsa-dspine.tar.gz       5.7 MB
+TARBALL_SHA256: d06f6dbe7bb25b6f91d6ff16696438897452ad3ae2b121e4bc60cc38bfdbebf7
+MANIFEST:        releases/v2.0-fp16-qwen38-lsa-dspine/MANIFEST.sha256          1705 项
+SOURCE_MANIFEST: releases/v2.0-fp16-qwen38-lsa-dspine/source/MANIFEST.sha256   1660 项
+PREVIOUS:        releases/v1.1-lsa-dspine-graph/、releases/v1.0-lsa-dspine/
+HANDOFF:         LSA_SPEC_HANDOFF.md
+
+REMOTE_SNAPSHOT: amd03:/mnt/sda/<user>/releases/v2.0-fp16-qwen38-lsa-dspine/
+REMOTE_INSTALL:  /mnt/nvme1n1/sglang522/lib/python3.12/site-packages/{lsa,sglang}
+                 /mnt/sda/<user>/dspine_code/DSpine-main/sglang_dspine
+LAUNCH_RUNNING:  launch/graph_lsa.sh    ← 线上实际运行（bf16 权重 + KV bf16 + LSA + DSpine）
+ROLLBACK:        releases/v2.0-fp16-qwen38-lsa-dspine/restore.sh
+
+# 精度说明
+   线上权重与 KV cache 均为 bfloat16（16-bit）。标签 FP16 指 16-bit 精度档，非 IEEE fp16。
+   FP4/FP8 混合精度路线保留在 launch/fp4_*.sh 与 configs/config.nvfp4-kvbf16.json，
+   实测 FP4 权重每步快 1.5x，但与 DSpine 组合 accept 5.02→1.37，故未采用。
+
+# 线上实测参数（V2.0-FP16 当前实例）
+  显存：97,887 MiB 总量 / 已用 92,723 MiB (94.7%) / 可用 4,527 MiB
+        scheduler 子进程 92,018 MiB + 启动器 676 MiB
+        KV cache bf16 124,850 token（K 1.19 GB + V 1.19 GB = 2.38 GiB）
+        LSA 索引 ≈0.95–1.0 GB（484.8 B/键/层 × 124,850 键 × 16 层）
+        权重 bf16 27B ≈54 GiB，DSpine 草稿 3.92 GB
+  参数：--speculative-algorithm DSPINE / num-draft-tokens 16 / attention triton / page-size 1
+        linear-attn triton / mamba-ssm float32 / extra_buffer / max-mamba-cache-size 64
+        mem-fraction-static 0.82 / context-length 131072 / max-running-requests 32→实际 12
+        cuda-graph-max-bs-decode 32 / 仅关 prefill 图（verify 图开启）
+        json override：lsa projections=…d2048.pt, query_heads=all
+  效能：均值 123.6 tok/s（A52.4 B198.2 C81.0 D173.4 E113.2）；@119k decode 94.55 tok/s
+        并发 12 → 495.4 tok/s；并发档 c19 的 16 并发 → 605.6 tok/s（峰值）
+
+# 本版内容（相对 v1.1）
+  1. verify CUDA graph（v4/v5/v7）→ @119k decode +15.6%
+  2. 并发致命 bug 修复（v12）：padding 批按真实 rids 截断
+  3. MTP/NEXTN 兼容（v9）：replay 视图无 host seq_lens 时回落设备张量
+  4. fp8 KV 支持（v10/v11）：非 bf16 缓存按 k_scale 反量化读出 → FP4 路线可用
+  5. DSpine 稳定补丁：采样轮缺草稿链时降级到 stock DFlash 验证，不再杀 scheduler
+  6. SPL 串行草稿：prompt lookup 续接草稿链（默认关闭，SPL_ENABLE=1）
+  7. FP4 混合精度支持（NVFP4 MLP + FP8 注意力 + KV bf16），每步 1.5x
+
+# 已知限制
+  - FP4 包必须摘掉 kv_cache_scheme 才能让 KV 回 bf16（否则 auto→fp8，LSA 拒或数值崩坏）
+  - FP4 与 DSpine 组合 accept 崩塌，不推荐；FP4+MTP accept 4.46
+  - 串行草稿（SPL）在当前负载集上与基线持平
+  - 远端出向 TCP 100 KiB 上限：HTTP 必须走 UDS；torch TCPStore 仍走 TCP，可能偶发崩溃
+  - 隧道为会话级作业；每次重启远端服务后必须重建（用 127.0.0.1，勿用 localhost）
