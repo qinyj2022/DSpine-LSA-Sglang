@@ -4,8 +4,8 @@
 
 - **DSpine**（Tencent，Apache-2.0）— 并行草稿投机解码，一次前向出 16 个草稿 token
 - **LSA**（Prefrontal-AI/latent-sparse-attention，Apache-2.0）— 稀疏注意力索引，把长上下文注意力代价钉死在 `top_k`
-- 承载在 **SGLang 0.5.22** 上，GPU 为 RTX PRO 6000 Blackwell Max-Q（sm120，97,887 MiB）
-
+- 承载在 **SGLang 0.5.22** 上，GPU 为 RTX PRO 6000 （sm120，97,887 MiB）
+- 16并发达到600toks/s的吞吐，100K 1M长上下文性能不减
 本仓库是该组合的**适配补丁、启动脚本、测量工具与全部实测结果**。没有模型权重。
 
 ---
