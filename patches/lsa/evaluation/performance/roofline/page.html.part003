@@ -1,0 +1,269 @@
+s": "axisline" }, svg);
+  S("text", { x: (m.l + W - m.r) / 2, y: H - 10, "text-anchor": "middle", "class": "axlab", text: "Arithmetic intensity at " + (mode === "dram" ? "DRAM" : "L2") + " (FLOP per byte)" }, svg);
+  S("text", { transform: "translate(16," + ((m.t + H - m.b) / 2) + ") rotate(-90)", "text-anchor": "middle", "class": "axlab", text: "Achieved FLOP/s" }, svg);
+  function seg(xa, ya, xb, yb, cls) {
+    // Clip a segment to the plot's y range
+    if (yb > y1 || ya < y0) return;
+    S("line", { x1: X(xa), y1: Y(ya), x2: X(xb), y2: Y(yb), "class": cls }, svg);
+  }
+  function hline(peak, label, from, cls, dy) {
+    if (peak === null) return;
+    var xa = Math.max(x0, from);
+    S("line", { x1: X(xa), x2: X(x1), y1: Y(peak), y2: Y(peak), "class": cls }, svg);
+    S("text", { x: X(x1) + 5, y: Y(peak) + 4 + (dy || 0), "class": "rooflab", text: label }, svg);
+  }
+  if (M.bf16 !== null) hline(M.bf16, "bf16 tensor " + sig(M.bf16 / 1e12) + " T", bw ? M.bf16 / bw : x0, "roof", -7);
+  if (M.tf32 !== null) hline(M.tf32, "tf32 tensor " + sig(M.tf32 / 1e12) + " T", bw ? M.tf32 / bw : x0, "roof");
+  if (M.fp32 !== null) hline(M.fp32, "FP32 " + sig(M.fp32 / 1e12) + " T", bw ? M.fp32 / bw : x0, "roof");
+  function slope(b, label, cls, cap, frac, dy) {
+    var xa = Math.max(x0, y0 / b), xb = Math.min(x1, (cap || M.bf16 || y1) / b);
+    if (xb <= xa) return;
+    S("line", { x1: X(xa), y1: Y(b * xa), x2: X(xb), y2: Y(b * xb), "class": cls }, svg);
+    var xm = Math.pow(10, Math.log10(xa) + (Math.log10(xb) - Math.log10(xa)) * frac);
+    var ang = Math.atan2(Y(b * xb) - Y(b * xa), X(xb) - X(xa)) * 180 / Math.PI;
+    S("text", { transform: "translate(" + X(xm) + "," + (Y(b * xm) + (dy || -6)) + ") rotate(" + ang + ")", "text-anchor": "middle", "class": "rooflab", text: label }, svg);
+  }
+  if (bw) slope(bw, (mode === "dram" ? "HBM " : "L2 ") + sig(bw / 1e12) + " TB/s", "roof", M.bf16, 0.35);
+  if (mode === "dram" && M.copy) slope(M.copy, "copy " + sig(M.copy / 1e12) + " TB/s measured", "anchorline", M.gemm || M.bf16, 0.55, 14);
+  if (M.gemm) {
+    var from = mode === "dram" && M.copy ? M.gemm / M.copy : x0;
+    S("line", { x1: X(Math.max(x0, from)), x2: X(x1), y1: Y(M.gemm), y2: Y(M.gemm), "class": "anchorline" }, svg);
+    S("text", { x: X(x1) + 5, y: Y(M.gemm) + 4, "class": "rooflab", text: "GEMM " + sig(M.gemm / 1e12) + " T meas." }, svg);
+  }
+  if (!xs.length) {
+    S("text", { x: W / 2, y: H / 2, "text-anchor": "middle", "class": "axlab", text: "No kernel with counted FLOPs matches the filters" }, svg);
+  }
+  // Series and points
+  var series = seriesOf(xs);
+  var labelItems = [], allPts = [];
+  var cpts = xs.map(function (k) { return { x: X(k[key]), y: Y(Math.max(k.fps, y0)), k: k }; });
+  var tpts = txs.map(function (k) { return { x: X(k[key]), y: Y(Math.max(k.fps, y0)), k: k }; });
+  var tmax = {};
+  txs.forEach(function (k) { tmax[k.stage] = Math.max(tmax[k.stage] || 0, k.context || 0); });
+  // Connectors sit under the CuTeDSL markers
+  tpts.forEach(function (t) {
+    var c = partner(t, cpts);
+    if (c) S("line", { x1: c.x, y1: c.y, x2: t.x, y2: t.y, style: "stroke:" + cssVar(STAGE_INDEX[t.k.stage]) + ";stroke-width:1;opacity:0.7" }, svg);
+  });
+  series.forEach(function (list) {
+    var si = STAGE_INDEX[list[0].stage], color = cssVar(si);
+    var pts = list.map(function (k) { return { x: X(k[key]), y: Y(Math.max(k.fps, y0)), k: k }; });
+    if (pts.length > 1) S("polyline", { points: pts.map(function (p) { return p.x + "," + p.y; }).join(" "), fill: "none", style: "stroke:" + color + ";stroke-width:1;opacity:0.6" }, svg);
+    var maxCtx = list.reduce(function (a, k) { return Math.max(a, k.context || 0); }, 0);
+    pts.forEach(function (p) {
+      var big = (p.k.context || 0) === maxCtx;
+      S("path", { d: shapePath(STAGES[si].shape, big ? 5.5 : 3.6), transform: "translate(" + p.x + "," + p.y + ")", style: "fill:" + color + ";stroke:var(--panel);stroke-width:1;opacity:" + (big ? 1 : 0.6) }, svg);
+      allPts.push(p);
+    });
+    var last = pts[pts.length - 1];
+    labelItems.push({ x: last.x, y: last.y, text: list[0].label, pts: pts.concat(tpts) });
+  });
+  tpts.forEach(function (t) {
+    var si = STAGE_INDEX[t.k.stage], color = cssVar(si), isBig = (t.k.context || 0) === tmax[t.k.stage];
+    S("path", { d: shapePath(STAGES[si].shape, isBig ? 5.5 : 3.6), transform: "translate(" + t.x + "," + t.y + ")", style: "fill:var(--panel);stroke:" + color + ";stroke-width:1.6;opacity:" + (isBig ? 1 : 0.75) }, svg);
+  });
+  placeLabels(svg, labelItems, { x0: m.l + 2, x1: W - m.r - 2, y0: m.t + 2, y1: H - m.b - 2 });
+  tpts.forEach(function (p) {
+    var k = p.k;
+    var hit = S("circle", { cx: p.x, cy: p.y, r: 11, fill: "transparent", tabindex: "0", "aria-label": k.label + " at " + ctxTitle(k) + ": " + fmtFlops(k.fps) }, svg);
+    attachTip(hit, function () {
+      var c = cuteNs(k.step, k.context);
+      return [k.label, stepName(k.step) + " / " + k.stage + ", " + k.launches + " launches summed", ["context", ctxTitle(k)], ["time", fmtUs(k.ns)], ["CuTeDSL step", c === null ? "n/a" : fmtUs(c)], ["achieved", fmtFlops(k.fps)], ["DRAM", k.gbps === null ? "n/a" : sig(k.gbps) + " GB/s"], ["intensity", sig(k[key]) + " FLOP/B"]];
+    });
+  });
+  allPts.forEach(function (p) {
+    var k = p.k;
+    var hit = S("circle", { cx: p.x, cy: p.y, r: 11, fill: "transparent", tabindex: "0", "aria-label": k.label + " at " + ctxTitle(k) + ": " + fmtFlops(k.fps) }, svg);
+    attachTip(hit, function () {
+      var pc = roofPct(k, k[key], bw);
+      return [k.label, stepName(k.step) + " / " + k.stage, ["context", ctxTitle(k)], ["time", fmtUs(k.ns)], ["achieved", fmtFlops(k.fps)], ["DRAM", k.gbps === null ? "n/a" : sig(k.gbps) + " GB/s"], ["intensity", sig(k[key]) + " FLOP/B"], ["of its roof", pc === null ? "n/a" : pct(pc)]];
+    });
+  });
+  tableInto($("#rf-table"), ["Kernel", "Step", "Context", "Time", "TFLOP/s", "DRAM GB/s", "FLOP/B (" + mode + ")", "% of roof"], xs.concat(txs).map(function (k) {
+    var pc = roofPct(k, k[key], bw);
+    return [k.label, stepName(k.step), ctxTitle(k), fmtUs(k.ns), fmtTflops(k.fps), k.gbps === null ? "n/a" : sig(k.gbps), sig(k[key]), pc === null ? "n/a" : pct(pc)];
+  }), 3);
+}
+
+/* ---------- speed of light ---------- */
+function drawSol() {
+  var svg = $("#sol-svg"); clear(svg);
+  var W = 860, H = 520, m = { l: 62, r: 24, t: 16, b: 52 };
+  svg.setAttribute("viewBox", "0 0 " + W + " " + H);
+  var list = plotted().filter(function (k) { return k.sm !== null && k.mem !== null; });
+  if (!KERNELS.length) return emptyChart(svg, W, H, "No kernel records in this profile");
+  var X = makeScale(0, 100, m.l, W - m.r, false), Y = makeScale(0, 100, H - m.b, m.t, false);
+  [0, 20, 40, 60, 80, 100].forEach(function (v) {
+    S("line", { x1: X(v), x2: X(v), y1: m.t, y2: H - m.b, "class": "gridline" }, svg);
+    S("line", { x1: m.l, x2: W - m.r, y1: Y(v), y2: Y(v), "class": "gridline" }, svg);
+    S("text", { x: X(v), y: H - m.b + 16, "text-anchor": "middle", "class": "tick", text: v }, svg);
+    S("text", { x: m.l - 8, y: Y(v) + 4, "text-anchor": "end", "class": "tick", text: v }, svg);
+  });
+  S("rect", { x: m.l, y: m.t, width: W - m.l - m.r, height: H - m.t - m.b, fill: "none", "class": "axisline" }, svg);
+  S("line", { x1: X(0), y1: Y(0), x2: X(100), y2: Y(100), "class": "anchorline" }, svg);
+  S("text", { x: X(100) - 6, y: Y(100) + 14, "text-anchor": "end", "class": "rooflab", text: "SM = memory" }, svg);
+  S("text", { x: (m.l + W - m.r) / 2, y: H - 10, "text-anchor": "middle", "class": "axlab", text: "Memory throughput (% of peak)" }, svg);
+  S("text", { transform: "translate(16," + ((m.t + H - m.b) / 2) + ") rotate(-90)", "text-anchor": "middle", "class": "axlab", text: "SM throughput (% of peak)" }, svg);
+  var maxCtx = list.reduce(function (a, k) { return Math.max(a, k.context || 0); }, 0);
+  var labelItems = [], pts = [];
+  var tlist = triPlotted().filter(function (k) { return k.sm !== null && k.mem !== null; });
+  var tpts = tlist.map(function (k) { return { x: X(k.mem), y: Y(k.sm), k: k }; });
+  var cpts = list.map(function (k) { return { x: X(k.mem), y: Y(k.sm), k: k }; });
+  tpts.forEach(function (t) {
+    var c = partner(t, cpts);
+    if (c) S("line", { x1: c.x, y1: c.y, x2: t.x, y2: t.y, style: "stroke:" + cssVar(STAGE_INDEX[t.k.stage]) + ";stroke-width:1;opacity:0.7" }, svg);
+  });
+  list.forEach(function (k) {
+    var si = STAGE_INDEX[k.stage], big = k.stage === "anchor" || (k.context || 0) === maxCtx;
+    var p = { x: X(k.mem), y: Y(k.sm), k: k };
+    pts.push(p);
+    S("path", { d: shapePath(STAGES[si].shape, big ? 5.5 : 3.6), transform: "translate(" + p.x + "," + p.y + ")", style: "fill:" + cssVar(si) + ";stroke:var(--panel);stroke-width:1;opacity:" + (big ? 1 : 0.6) }, svg);
+  });
+  tpts.forEach(function (t) {
+    var si = STAGE_INDEX[t.k.stage], isBig = (t.k.context || 0) === maxCtx;
+    S("path", { d: shapePath(STAGES[si].shape, isBig ? 5.5 : 3.6), transform: "translate(" + t.x + "," + t.y + ")", style: "fill:var(--panel);stroke:" + cssVar(si) + ";stroke-width:1.6;opacity:" + (isBig ? 1 : 0.75) }, svg);
+  });
+  var allSol = pts.concat(tpts);
+  pts.forEach(function (p) { if (p.k.stage === "anchor" || (p.k.context || 0) === maxCtx) labelItems.push({ x: p.x, y: p.y, text: p.k.label, pts: allSol }); });
+  placeLabels(svg, labelItems, { x0: m.l + 2, x1: W - m.r - 2, y0: m.t + 2, y1: H - m.b - 2 });
+  tpts.forEach(function (p) {
+    var k = p.k;
+    var hit = S("circle", { cx: p.x, cy: p.y, r: 11, fill: "transparent", tabindex: "0", "aria-label": k.label + " at " + ctxTitle(k) + ": SM " + pct(k.sm) + ", memory " + pct(k.mem) }, svg);
+    attachTip(hit, function () { return [k.label, stepName(k.step) + " / " + k.stage + ", " + k.launches + " launches, weighted by time", ["context", ctxTitle(k)], ["time", fmtUs(k.ns)], ["SM throughput", pct(k.sm)], ["memory throughput", pct(k.mem)], ["DRAM throughput", pct(k.dramPct)], ["L2 throughput", pct(k.l2Pct)]]; });
+  });
+  pts.forEach(function (p) {
+    var k = p.k;
+    var hit = S("circle", { cx: p.x, cy: p.y, r: 11, fill: "transparent", tabindex: "0", "aria-label": k.label + " at " + ctxTitle(k) + ": SM " + pct(k.sm) + ", memory " + pct(k.mem) }, svg);
+    attachTip(hit, function () { return [k.label, stepName(k.step) + " / " + k.stage, ["context", ctxTitle(k)], ["time", fmtUs(k.ns)], ["SM throughput", pct(k.sm)], ["memory throughput", pct(k.mem)], ["DRAM throughput", pct(k.dramPct)], ["L2 throughput", pct(k.l2Pct)]]; });
+  });
+  tableInto($("#sol-table"), ["Kernel", "Step", "Context", "SM %", "Memory %", "DRAM %", "L2 %"], list.concat(tlist).map(function (k) { return [k.label, stepName(k.step), ctxTitle(k), fix(k.sm, 1), fix(k.mem, 1), fix(k.dramPct, 1), fix(k.l2Pct, 1)]; }), 3);
+}
+
+/* ---------- time ---------- */
+function drawTime() {
+  var host = $("#time-panels"); clear(host);
+  var withMs = STEPS.filter(function (s) { return s.ms !== null && s.context !== null; });
+  if (!withMs.length) { host.appendChild(el("p", { "class": "empty" }, ["No step timings in this profile."])); return; }
+  var ymin = Math.min.apply(null, withMs.map(function (s) { return s.ms; })), ymax = Math.max.apply(null, withMs.map(function (s) { return s.ms; }));
+  var y0 = Math.pow(10, Math.floor(Math.log10(ymin))), y1 = Math.pow(10, Math.ceil(Math.log10(ymax)));
+  if (y1 <= y0) y1 = y0 * 10;
+  var cx = CONTEXTS.length ? [CONTEXTS[0], CONTEXTS[CONTEXTS.length - 1]] : [1, 10];
+  if (cx[0] === cx[1]) cx[1] = cx[0] * 2;
+  STAGES.forEach(function (st, si) {
+    var rows = withMs.filter(function (s) { return s.stage === st.id; });
+    if (!rows.length) return;
+    var names = Array.from(new Set(rows.map(function (s) { return s.step; })));
+    var W = 460, H = 280, m = { l: 56, r: 14, t: 12, b: 40 };
+    var X = makeScale(cx[0], cx[1], m.l, W - m.r, true), Y = makeScale(y0, y1, H - m.b, m.t, true);
+    var svg = S("svg", { viewBox: "0 0 " + W + " " + H, role: "img", "aria-label": st.label + " step times against context" });
+    CONTEXTS.forEach(function (c) {
+      S("line", { x1: X(c), x2: X(c), y1: m.t, y2: H - m.b, "class": "gridline" }, svg);
+      S("text", { x: X(c), y: H - m.b + 15, "text-anchor": "middle", "class": "tick", text: ctxLabel(c) }, svg);
+    });
+    logTicks(y0, y1).forEach(function (v) {
+      S("line", { x1: m.l, x2: W - m.r, y1: Y(v), y2: Y(v), "class": "gridline" }, svg);
+      S("text", { x: m.l - 6, y: Y(v) + 4, "text-anchor": "end", "class": "tick", text: v >= 1 ? String(v) : String(+v.toPrecision(1)) }, svg);
+    });
+    S("rect", { x: m.l, y: m.t, width: W - m.l - m.r, height: H - m.t - m.b, fill: "none", "class": "axisline" }, svg);
+    S("text", { x: (m.l + W - m.r) / 2, y: H - 4, "text-anchor": "middle", "class": "axlab", text: "Context (tokens)" }, svg);
+    S("text", { transform: "translate(13," + ((m.t + H - m.b) / 2) + ") rotate(-90)", "text-anchor": "middle", "class": "axlab", text: "Median ms" }, svg);
+    var lg = el("div", { "class": "legend" });
+    names.forEach(function (name, ni) {
+      var pts = rows.filter(function (s) { return s.step === name; }).sort(function (a, b) { return a.context - b.context; });
+      var shape = SERIES_SHAPES[ni % SERIES_SHAPES.length], dash = ni % 3 === 0 ? "" : ni % 3 === 1 ? "6 3" : "2 3";
+      var c = cssVar(si);
+      if (pts.length > 1) S("polyline", { points: pts.map(function (s) { return X(s.context) + "," + Y(s.ms); }).join(" "), fill: "none", style: "stroke:" + c + ";stroke-width:1.25;stroke-dasharray:" + dash }, svg);
+      pts.forEach(function (s) {
+        S("path", { d: shapePath(shape, 4), transform: "translate(" + X(s.context) + "," + Y(s.ms) + ")", style: "fill:" + c + ";stroke:var(--panel);stroke-width:1" }, svg);
+        var hit = S("circle", { cx: X(s.context), cy: Y(s.ms), r: 11, fill: "transparent", tabindex: "0", "aria-label": stepName(name) + " at " + ctxLabel(s.context) + ": " + sig(s.ms) + " ms" }, svg);
+        attachTip(hit, function () { return [stepName(name), st.label, ["context", ctxLabel(s.context)], ["median", sig(s.ms) + " ms"], ["min", s.min === null ? "n/a" : sig(s.min) + " ms"]]; });
+      });
+      var ls = S("svg", { viewBox: "-1 -8 30 16", width: 30, height: 14, "aria-hidden": "true" });
+      S("line", { x1: 0, x2: 28, y1: 0, y2: 0, style: "stroke:" + c + ";stroke-width:1.25;stroke-dasharray:" + dash }, ls);
+      S("path", { d: shapePath(shape, 4), transform: "translate(14,0)", style: "fill:" + c }, ls);
+      lg.appendChild(el("span", {}, [ls, stepName(name)]));
+    });
+    var panel = el("div", { "class": "panel" }, [el("h3", {}, [glyph(si, 14), st.label]), el("div", { "class": "frame" }, [svg]), lg]);
+    svg.style.cssText = "display:block;width:100%;height:auto";
+    host.appendChild(panel);
+  });
+  var names = Array.from(new Set(withMs.map(function (s) { return s.step; })));
+  tableInto($("#time-table"), ["Step"].concat(CONTEXTS.map(ctxLabel)), names.map(function (n) {
+    return [stepName(n)].concat(CONTEXTS.map(function (c) { var s = withMs.filter(function (r) { return r.step === n && r.context === c; })[0]; return s ? sig(s.ms) : ""; }));
+  }), 1);
+}
+
+/* ---------- tables ---------- */
+function tableInto(host, heads, rows, leftCols) {
+  clear(host);
+  if (!rows.length) { host.appendChild(el("p", { "class": "empty" }, ["No rows for the current filters."])); return; }
+  var t = el("table");
+  t.appendChild(el("thead", {}, [el("tr", {}, heads.map(function (h, i) { return el("th", { "class": i < leftCols ? "l" : "" }, [h]); }))]));
+  t.appendChild(el("tbody", {}, rows.map(function (r) { return el("tr", {}, r.map(function (c, i) { return el("td", { "class": i < leftCols ? "l" : "" }, [String(c)]); })); })));
+  host.appendChild(t);
+}
+var ALL_COLS = [
+  { h: "Stage", v: function (k) { return k.stage; }, s: "text" },
+  { h: "Step", v: function (k) { return stepName(k.step); }, s: "text" },
+  { h: "Kernels", v: function (k) { return k.kernels; }, s: "text" },
+  { h: "Kernel", v: function (k) { return k.cutedsl ? k.label : k.name.slice(0, 32); }, s: "text" },
+  { h: "Context", v: function (k) { return k.context; }, f: ctxTitle, s: "num" },
+  { h: "Time us", v: function (k) { return k.ns === null ? null : k.ns / 1e3; }, f: function (k) { return k.ns === null ? "n/a" : sig(k.ns / 1e3); }, s: "num" },
+  { h: "TFLOP/s", v: function (k) { return k.fps === null ? null : k.fps / 1e12; }, f: function (k) { return fmtTflops(k.fps); }, s: "num" },
+  { h: "DRAM GB/s", v: function (k) { return k.gbps; }, f: function (k) { return k.gbps === null ? "n/a" : sig(k.gbps); }, s: "num" },
+  { h: "FLOP/B DRAM", v: function (k) { return k.iD; }, f: function (k) { return k.iD === null ? "n/a" : sig(k.iD); }, s: "num" },
+  { h: "FLOP/B L2", v: function (k) { return k.iL; }, f: function (k) { return k.iL === null ? "n/a" : sig(k.iL); }, s: "num" },
+  { h: "SM %", v: function (k) { return k.sm; }, f: function (k) { return fix(k.sm, 1); }, s: "num" },
+  { h: "Memory %", v: function (k) { return k.mem; }, f: function (k) { return fix(k.mem, 1); }, s: "num" },
+  { h: "DRAM %", v: function (k) { return k.dramPct; }, f: function (k) { return fix(k.dramPct, 1); }, s: "num" },
+  { h: "Grid", v: function (k) { return k.grid; }, s: "num" },
+  { h: "Block", v: function (k) { return k.block; }, s: "num" },
+  { h: "Regs", v: function (k) { return k.regs; }, s: "num" },
+  { h: "Smem KB", v: function (k) { return k.smem === null ? null : k.smem / 1024; }, f: function (k) { return k.smem === null ? "n/a" : sig(k.smem / 1024); }, s: "num" },
+  { h: "Occupancy %", v: function (k) { return k.occ; }, f: function (k) { return fix(k.occ, 1); }, s: "num" }
+];
+var sortState = { col: 1, dir: 1 }, kernelsFilter = "all";
+function drawAll() {
+  var host = $("#all-table"); clear(host);
+  if (!ALLK.length) { host.appendChild(el("p", { "class": "empty" }, ["No kernel records in this profile."])); return; }
+  var rows = ALLK.filter(function (k) { return kernelsFilter === "all" || k.kernels === kernelsFilter; }).sort(function (a, b) {
+    var c = ALL_COLS[sortState.col], va = c.v(a), vb = c.v(b);
+    if (va === null || va === undefined) return 1;
+    if (vb === null || vb === undefined) return -1;
+    var r = c.s === "num" ? va - vb : String(va).localeCompare(String(vb));
+    return (r || a.index - b.index) * sortState.dir;
+  });
+  var t = el("table");
+  var htr = el("tr");
+  ALL_COLS.forEach(function (c, i) {
+    var b = el("button", { type: "button" }, [c.h + (sortState.col === i ? (sortState.dir > 0 ? " (asc)" : " (desc)") : "")]);
+    b.addEventListener("click", function () { if (sortState.col === i) sortState.dir *= -1; else { sortState.col = i; sortState.dir = 1; } drawAll(); var nb = $("#all-table thead th:nth-child(" + (i + 1) + ") button"); if (nb) nb.focus(); });
+    var th = el("th", { "class": i < 4 ? "l" : "", scope: "col", "aria-sort": sortState.col === i ? (sortState.dir > 0 ? "ascending" : "descending") : "none" }, [b]);
+    htr.appendChild(th);
+  });
+  t.appendChild(el("thead", {}, [htr]));
+  var tb = el("tbody");
+  rows.forEach(function (k) {
+    var tr = el("tr");
+    ALL_COLS.forEach(function (c, i) {
+      var v = c.f ? c.f(k) : (c.v(k) === null || c.v(k) === undefined ? "n/a" : String(c.v(k)));
+      var td = el("td", { "class": i < 4 ? "l" : "" }, []);
+      if (i === 0) { td.className = "l mk"; td.appendChild(glyph(STAGE_INDEX[k.stage], 12)); }
+      td.appendChild(document.createTextNode(v));
+      tr.appendChild(td);
+    });
+    tb.appendChild(tr);
+  });
+  t.appendChild(tb);
+  host.appendChild(t);
+}
+
+function redraw() { drawRoofline(); drawSol(); }
+(function kernelsControl() {
+  var sel = $("#f-kernels-table");
+  if (!HAS_TRITON) { $("#kernels-controls").style.display = "none"; return; }
+  sel.addEventListener("change", function () { kernelsFilter = sel.value; drawAll(); });
+})();
+redraw(); drawTime(); drawAll();
+})();
+</script>
