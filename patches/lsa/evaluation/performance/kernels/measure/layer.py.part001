@@ -1,0 +1,6 @@
+   parser.error("Graph profiling requires decode, --profile and --graph-compare")
+    run(args)
+
+
+if __name__ == "__main__":
+    main()
