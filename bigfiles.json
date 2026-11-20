@@ -1,5 +1,6 @@
 {
- "note": "large files stored split; run tools/join_parts.py to rebuild",
+ "limit_bytes": 45000,
+ "note": "parts of files larger than limit_bytes; run python tools/join_parts.py .",
  "files": {
   "patches/lsa/core/kernels/cutedsl/beam.py": [
    "patches/lsa/core/kernels/cutedsl/beam.py.part000",
