@@ -1,0 +1,283 @@
+ 1.f; S.fsel[R] = 0.f; S.fbnd[R] = 0.f; S.need[R] = 0;
+          S.state[R] = 0; S.bA[R] = 0.f; S.bC[R] = -INFINITY;
+        } else {
+          S.iflag[it] = 1;
+          set_band(S, R, nlo, nhi, scale);
+        }
+      }
+    }
+    bar_sync(1, 256);
+    bar_arrive(2, 288);
+    if (!S.iflag[it]) break;
+  }
+  run_pass<3>(X, c, kt0, span, span);
+  if (PROF && X.ct == 0) atomicAdd(&g_dbg[14], (unsigned long long)(clock64() - tp5));
+  }   // flag2
+  }   // act
+  if (p.uni) {
+    // Group union, fused: the last of the 4 head-pair CTAs of this (b, KV group, q tile) to finish
+    // merges the 8 heads' rows (their per-head top_k lists, in global memory) into one
+    // deduplicated list per row; a T-bit shared bitmap marks the ids seen.
+    __threadfence();
+    bar_sync(1, 256);
+    const int grpk = pair >> 2, gidx = (b * 2 + grpk) * p.nqt + qt;
+    if (tid == 0) {
+      const int old = atomicAdd(&p.gcnt[gidx], 1);
+      S.ulast = old == 3;
+      if (old == 3) p.gcnt[gidx] = 0;
+    }
+    bar_sync(1, 256);
+    const int K = 8 * topk, nw = (T + 31) >> 5;
+    if (S.ulast && nw * 8 <= REGION / 4) {
+      // one row per warp at a time, a bitmap per warp; positions from ballot prefixes
+      __threadfence();
+      unsigned* wb = hist + X.gw * nw;
+      for (int w = lane; w < nw; w += 32) wb[w] = 0u;
+      __syncwarp();
+      const unsigned lt = (1u << lane) - 1u;
+      for (int r = X.gw; r < 64; r += 8) {
+        const int i = i0 + r;
+        if (i >= T) break;
+        int* urow = p.uout + ((size_t)(b * 2 + grpk) * T + i) * K;
+        const int* src = p.out + ((size_t)(b * 16 + grpk * 8) * T + i) * topk;
+        int cnt = 0;
+        for (int e0 = 0; e0 < K; e0 += 32) {
+          const int e = e0 + lane;
+          const int id = e < K ? __ldcg(src + (size_t)(e / topk) * T * topk + (e % topk)) : -1;
+          bool nw_ = false;
+          if (id >= 0) { const unsigned bit = 1u << (id & 31); nw_ = !(atomicOr(&wb[id >> 5], bit) & bit); }
+          const unsigned bal = __ballot_sync(FULLM, nw_);
+          if (nw_) urow[cnt + __popc(bal & lt)] = id;
+          cnt += __popc(bal);
+        }
+        for (int e = cnt + lane; e < K; e += 32) urow[e] = -1;
+        __syncwarp();
+        for (int e = lane; e < K; e += 32) {
+          const int id = __ldcg(src + (size_t)(e / topk) * T * topk + (e % topk));
+          if (id >= 0) wb[id >> 5] = 0u;
+        }
+        __syncwarp();
+      }
+    } else if (S.ulast) {
+      __threadfence();
+      for (int w = tid; w < nw; w += 256) hist[w] = 0u;
+      for (int r = 0; r < 64; r++) {
+        const int i = i0 + r;
+        if (i >= T) break;
+        if (tid == 0) S.ucnt = 0;
+        bar_sync(1, 256);
+        int* urow = p.uout + ((size_t)(b * 2 + grpk) * T + i) * K;
+        for (int e = tid; e < K; e += 256) {
+          const int hh = grpk * 8 + e / topk;
+          const int id = __ldcg(p.out + ((size_t)(b * 16 + hh) * T + i) * topk + (e % topk));
+          if (id >= 0) {
+            const unsigned bit = 1u << (id & 31);
+            if (!(atomicOr(&hist[id >> 5], bit) & bit)) urow[atomicAdd(&S.ucnt, 1)] = id;
+          }
+        }
+        bar_sync(1, 256);
+        for (int e = S.ucnt + tid; e < K; e += 256) urow[e] = -1;
+        for (int e = tid; e < K; e += 256) {
+          const int hh = grpk * 8 + e / topk;
+          const int id = __ldcg(p.out + ((size_t)(b * 16 + hh) * T + i) * topk + (e % topk));
+          if (id >= 0) hist[id >> 5] = 0u;
+        }
+        bar_sync(1, 256);
+      }
+    }
+  }
+}
+
+void run(torch::Tensor q, torch::Tensor k, torch::Tensor out, torch::Tensor buf, int64_t topk, int64_t window,
+         int64_t sink, double scale, int64_t cap, int64_t capb, int64_t nsamp, int64_t tm, torch::Tensor uout, torch::Tensor gcnt, int64_t uni) {
+  Params p;
+  p.out = out.data_ptr<int>(); p.buf = (unsigned*)buf.data_ptr();
+  p.B = q.size(0); p.T = q.size(2);
+  p.topk = topk; p.window = window; p.sink = sink; p.scale = (float)scale; p.cap = cap; p.capb = capb; p.nsamp = nsamp; p.tm = (int)tm; p.uni = (int)uni; p.uout = uout.data_ptr<int>(); p.gcnt = gcnt.data_ptr<int>();
+  p.H = q.size(1); p.HK = k.size(1); p.G = p.H / p.HK;
+  p.RS = (p.G % 2 == 0) ? 0 : 64; p.NPAIR = p.RS ? p.H : p.H / 2; p.QT = p.RS ? 128 : 64;
+  p.nqt = (p.T + p.QT - 1) / p.QT;
+  CUtensorMap km = make_kmap(k.data_ptr(), (long)p.B * p.HK * p.T, BN);
+  CUtensorMap qm = make_kmap(q.data_ptr(), (long)p.B * p.H * p.T, 64);
+  size_t smem = 1024 + NST * BN * 128 + 2 * 8192 + (2 * NST + 2) * 8 + REGION + sizeof(Smem);
+  cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+  kern<<<p.nqt * p.B * p.NPAIR, 384, smem, at::cuda::getCurrentCUDAStream()>>>(km, qm, p);
+}
+// Group union: in = (B, 16, T, kh) per-head top-kh ids, out = (B, 2, T, 8 kh): per (b, kv head, row)
+// the deduplicated union of its 8 heads' ids, -1 padded. A CTA takes RPC rows in turn; a T-bit
+// shared bitmap marks the ids seen (cleared again id by id), positions come from a shared counter.
+#define RPC 16
+__global__ void __launch_bounds__(256) merge_group(const int* __restrict__ in, int* __restrict__ out, int B, int T, int kh) {
+  extern __shared__ unsigned bm[];
+  __shared__ int cnt;
+  const int K = 8 * kh, nw = (T + 31) >> 5, nrows = B * 2 * T;
+  for (int w = threadIdx.x; w < nw; w += blockDim.x) bm[w] = 0u;
+  __syncthreads();
+  for (int rr = 0; rr < RPC; rr++) {
+    const int gi = blockIdx.x * RPC + rr;
+    if (gi >= nrows) break;
+    const int b = gi / (2 * T), g = (gi / T) % 2, i = gi % T;
+    if (threadIdx.x == 0) cnt = 0;
+    __syncthreads();
+    int* orow = out + (size_t)gi * K;
+    for (int e = threadIdx.x; e < K; e += blockDim.x) {
+      const int h = g * 8 + e / kh;
+      const int id = in[((size_t)(b * 16 + h) * T + i) * kh + (e % kh)];
+      if (id >= 0) {
+        const unsigned bit = 1u << (id & 31);
+        if (!(atomicOr(&bm[id >> 5], bit) & bit)) orow[atomicAdd(&cnt, 1)] = id;
+      }
+    }
+    __syncthreads();
+    for (int e = cnt + threadIdx.x; e < K; e += blockDim.x) orow[e] = -1;
+    for (int e = threadIdx.x; e < K; e += blockDim.x) {
+      const int h = g * 8 + e / kh;
+      const int id = in[((size_t)(b * 16 + h) * T + i) * kh + (e % kh)];
+      if (id >= 0) bm[id >> 5] = 0u;
+    }
+    __syncthreads();
+  }
+}
+void merge(torch::Tensor in, torch::Tensor out) {
+  const int B = in.size(0), T = in.size(2), kh = in.size(3);
+  const int nrows = B * 2 * T;
+  merge_group<<<(nrows + RPC - 1) / RPC, 256, ((T + 31) / 32) * 4, at::cuda::getCurrentCUDAStream()>>>(
+      in.data_ptr<int>(), out.data_ptr<int>(), B, T, kh);
+}
+std::vector<int64_t> dbg() {
+  unsigned long long h[16];
+  cudaMemcpyFromSymbol(h, g_dbg, sizeof(h));
+  unsigned long long z[16] = {0};
+  cudaMemcpyToSymbol(g_dbg, z, sizeof(z));
+  return std::vector<int64_t>(h, h + 16);
+}
+std::vector<int64_t> prof() {
+  unsigned long long h[8];
+  cudaMemcpyFromSymbol(h, g_prof, sizeof(h));
+  unsigned long long z[8] = {0};
+  cudaMemcpyToSymbol(g_prof, z, sizeof(z));
+  return std::vector<int64_t>(h, h + 8);
+}
+std::vector<int64_t> attrs() {
+  cudaFuncAttributes a;
+  cudaFuncGetAttributes(&a, kern);
+  size_t smem = 1024 + NST * BN * 128 + 2 * 8192 + (2 * NST + 2) * 8 + REGION + sizeof(Smem);
+  cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+  int nb = 0;
+  cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, kern, 384, smem);
+  return {a.numRegs, (int64_t)a.localSizeBytes, (int64_t)smem, nb};
+}
+"""
+CPP = ("void run(torch::Tensor q, torch::Tensor k, torch::Tensor out, torch::Tensor buf, int64_t topk, int64_t window, "
+       "int64_t sink, double scale, int64_t cap, int64_t capb, int64_t nsamp, int64_t tm, torch::Tensor uout, torch::Tensor gcnt, int64_t uni);\nstd::vector<int64_t> dbg();\nvoid merge(torch::Tensor in, torch::Tensor out);\nstd::vector<int64_t> prof();\nstd::vector<int64_t> attrs();")
+
+
+def build(bn=64, nst=4, minb=2, su=2, abl=0, hinf=1, preg=24, creg=104, prof=0, qhm=8, ovl=0, pp=1, upm=0.6, meancut=0, tmr=4, tag=""):
+    defs = (f"#define BN {bn}\n#define NST {nst}\n#define WGMMA wgmma_ss_m64n{bn}\n#define MINB {minb}\n#define SU {su}\n"
+            f"#define ABL {abl}\n#define HINF {hinf}\n#define PREG {preg}\n#define CREG {creg}\n#define PROF {prof}\n#define QHM {float(qhm)}f\n#define OVL {ovl}\n#define PP {pp}\n#define UPM {float(upm)}f\n#define MEANCUT {meancut}\n#define TMR {tmr}\n")
+    return load_inline(name=f"lsa_fa3idx12_bn{bn}_s{nst}_m{minb}_u{su}_a{abl}_h{hinf}_r{preg}_{creg}_p{prof}_q{qhm}_o{ovl}{pp}_u{int(round(upm * 10))}_{meancut}_t{tmr}{tag}", cpp_sources=CPP,
+                       cuda_sources=HDR + wgmma_ss_fn(bn) + defs + BODY, functions=["run", "dbg", "merge", "prof", "attrs"],
+                       extra_cuda_cflags=["-O3", "-gencode=arch=compute_90a,code=sm_90a", "--expt-relaxed-constexpr"])
+
+
+class Indexer:
+    def __init__(self, bn=64, nst=4, minb=2, su=2, abl=0, hinf=1, preg=24, creg=104, prof=0, qhm=8, ovl=0, pp=1, upm=0.6, meancut=0, nsamp_keys=None, tmr=4, tmk=0, tag="") -> None:
+        # tmk: the largest top_k that takes the two-pass small-k path (at most 4 tmr)
+        self.ext = build(bn, nst, minb, su, abl, hinf, preg, creg, prof, qhm, ovl, pp, upm, meancut, tmr, tag)
+        self.tmk = min(tmk, 4 * tmr)
+        self.bn = bn
+        self.nsamp_keys = nsamp_keys
+        self.bufs = {}
+        self.gcnts = {}
+        self.nsm = {}
+
+    def debug_stats(self):
+        v = self.ext.dbg()
+        return {"fallback_rows": v[1], "level2_rows": v[2], "slot_fail": v[3], "fallback_ctas": v[4],
+                "fail_over_topk": v[5], "fail_short": v[6], "fail_overflow": v[7], "fail_width": v[8], "fail_hinf_top": v[9],
+                "cyc_sample": v[10], "cyc_band": v[11], "cyc_main": v[12], "cyc_final": v[13], "cyc_fallback": v[14]}
+
+    def __call__(self, q, k, top_k, window=0, sink=0, scale=None, buffer=None, uout=None):
+        b, hq, t, d = q.shape
+        hk = k.shape[1]
+        assert hq % hk == 0 and d == 64 and q.dtype == torch.bfloat16 and k.dtype == torch.bfloat16, \
+            "fa3idx: bf16, d 64, query heads a multiple of key heads only"
+        assert uout is None or (hq == 16 and hk == 2), "fa3idx: the group union takes hq 16, hk 2 only"
+        # lsa: ids (at most t - 1 - window) and a row's candidates (t - window - sink) in 16 bits
+        assert t - window <= 65536, "fa3idx: 16-bit key ids and histograms need t - window <= 65536"
+        scale = d ** -0.5 if scale is None else scale
+        q = q.contiguous(); k = k.contiguous()
+        out = torch.empty((b, hq, t, top_k), dtype=torch.int32, device=q.device)
+        dev = q.device
+        if dev not in self.nsm:
+            self.nsm[dev] = torch.cuda.get_device_properties(dev).multi_processor_count
+        nslots = self.nsm[dev] * 4
+        if buffer is not None:   # the band buffer's entries per row
+            cap = (min(int(buffer), t) + 31) // 32 * 32
+        else:
+            cap = int(3 * (8 * math.sqrt(top_k * t / 768.0) + 64)) + 256
+            cap = max(cap, 2 * top_k + 256)
+            cap = min(cap, t)
+            cap = (cap + 31) // 32 * 32
+        capb = cap
+        cap = (cap + top_k + 31) // 32 * 32   # per row: capb band entries + top_k winners, in 4 lane segments
+        # sample size (keys): 512 for t <= 4096, 1024 for t >= 16384 or top_k >= 1024, else 768
+        # (tuned on the dev cases), doubled while the expected band at the row with the most
+        # candidates, (8 sqrt(top_k sv / n) + 3) n / sv entries, would not fit in 0.6 capb
+        nmax = max(1, t - window - sink)
+        if self.nsamp_keys is not None:
+            sv = self.nsamp_keys
+        else:
+            sv = 1024 if (t >= 16384 or top_k >= 1024) else (512 if t <= 4096 else 768)
+        while sv < min(nmax, 8192) and (8 * math.sqrt(top_k * sv / nmax) + 3) * nmax / sv > 0.6 * capb:
+            sv *= 2
+        nsamp = max(1, sv // self.bn)
+        tm = 1 if top_k <= self.tmk else 0
+        need = nslots * 128 * max(cap, 1)
+        buf = self.bufs.get(dev)
+        if buf is None or buf.numel() < need:
+            buf = torch.empty(need, dtype=torch.int32, device=dev)
+            self.bufs[dev] = buf
+        self.ext.run(q, k, out, buf, int(top_k), int(window), int(sink), float(scale), cap, capb, nsamp, tm,
+                     uout if uout is not None else out, self._gcnt(dev, b * hk * ((t + 63) // 64)), 1 if uout is not None else 0)
+        return out
+
+    def _gcnt(self, dev, n):
+        g = self.gcnts.get(dev)
+        if g is None or g.numel() < n:
+            g = torch.zeros(max(n, 1), dtype=torch.int32, device=dev)   # self-resetting arrival counters
+            self.gcnts[dev] = g
+        return g
+
+    def group_union(self, q, k, top_k, window=0, sink=0, scale=None, per_head=None, fused=True):
+        """(b, 2, t, 8 top_k): per (b, KV group, row) the deduplicated union of the 8 heads' own top_k.
+        fused: one launch (the last head-pair CTA of each group and q tile merges); else the per-head
+        kernel then the separate merge kernel."""
+        b, hq, t, _ = q.shape
+        out = torch.empty((b, 2, t, 8 * top_k), dtype=torch.int32, device=q.device)
+        if fused and per_head is None:
+            self(q, k, top_k, window=window, sink=sink, scale=scale, uout=out)
+            return out
+        ph = self(q, k, top_k, window=window, sink=sink, scale=scale) if per_head is None else per_head
+        self.ext.merge(ph, out)
+        return out
+
+
+_default = None
+
+
+def indexer(q, k, top_k, window=0, sink=0, scale=None, buffer=None):
+    global _default
+    if _default is None:
+        _default = Indexer()
+    return _default(q, k, top_k, window=window, sink=sink, scale=scale, buffer=buffer)
+
+
+def indexer_group_union(q, k, top_k, window=0, sink=0, scale=None):
+    """Group union: each of the 8 query heads of a KV group selects its own top_k (the per-head
+    path above), then a merge kernel writes, per (b, kv head, row), the deduplicated union of the 8
+    sets: (b, 2, t, 8 top_k) int32, -1 padded. Two launches."""
+    global _default
+    if _default is None:
+        _default = Indexer()
+    return _default.group_union(q, k, top_k, window=window, sink=sink, scale=scale)
