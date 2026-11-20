@@ -1,0 +1,129 @@
+eleases every card's, under the other copies' kernels
+        peak = ""
+        if replica.inputs.type == "cuda":
+            peak = f", card peak {torch.cuda.max_memory_allocated(replica.inputs) / 2**30:.1f} GiB"
+        finished = time.monotonic()
+        with self._cond:
+            self.documents_read += 1
+            self.tokens_read += ids.shape[1]
+            self.forward_seconds += forwarded - began
+            self.target_seconds += finished - forwarded
+        print(
+            f"teacher: read {planned.documents.collection}/{selected.split}/{selected.name} at {ids.shape[1]} tokens "
+            f"on {replica.device} - forward {forwarded - began:.0f} s, targets {finished - forwarded:.0f} s for "
+            f"{len(layers)} layers{peak}",
+            flush=True,
+        )
+        return blobs
+
+    def _block_blobs(
+        self, replica: Replica, ids: torch.Tensor, positions: torch.Tensor, layers: list[int], name: str
+    ) -> tuple[dict[int, dict[str, Any]], float]:
+        """Read one document for a QSA indexer - each layer's blocks and sampled rows of `x`, and QSA's target.
+
+        Args:
+            replica: The copy.
+            ids: Token ids [1, T] int64, on the copy's card.
+            positions: Absolute query positions [Q] int64.
+            layers: The layers to keep.
+            name: The document's name.
+
+        Returns:
+            blobs: Each layer's blob, its blocks and rows in place of `x`.
+            forwarded: When the forward finished, on the monotonic clock.
+
+        Raises:
+            ValueError: The teacher was built for no QSA indexer.
+        """
+        if self.qsa_indexer is None:
+            raise ValueError("the teacher reads blocks for a QSA indexer, and was built for none")
+        block_size = self.qsa_indexer.block_size
+        views = BlockViews(
+            {layer: replica.readers[layer] for layer in layers}, positions, block_size, replica.reading
+        )
+        fields = Cache.QSA_KEY_AND_QUERY_FIELDS if replica.reading is not None else Cache.QSA_FIELDS
+        hooks = views.hook(replica.text_model)
+        try:
+            read_through(replica.text_model, ids, self.extraction.run.prefill)
+        finally:
+            for hook in hooks:
+                hook.remove()
+        forwarded = time.monotonic()
+        blobs = {}
+        for layer in layers:
+            q, k, block_x, query_x = views.take(layer)
+            blob = targets_blob(
+                replica.readers[layer],
+                q,
+                k.to(replica.inputs),
+                positions,
+                self.extraction,
+                name,
+                block_size=block_size,
+            )
+            blobs[layer] = {**blob, fields[0]: block_x, fields[1]: query_x}
+            del q, k
+        return blobs, forwarded
+
+    def _x_blobs(
+        self, replica: Replica, ids: torch.Tensor, positions: torch.Tensor, layers: list[int], name: str
+    ) -> dict[int, dict[str, Any]]:
+        """Read one document as an extraction does, each layer's input kept whole - a run on `x` itself.
+
+        Args:
+            replica: The copy.
+            ids: Token ids [1, T] int64, on the copy's card.
+            positions: Absolute query positions [Q] int64.
+            layers: The layers to keep.
+            name: The document's name.
+
+        Returns:
+            Each layer's blob, `x` included, as the extraction writes it.
+        """
+        captured = capture_layer_inputs(replica.text_model, layers, ids, self.extraction.run.prefill)
+        blobs = {}
+        for layer in layers:
+            self._halt_if_stopped()
+            hidden, position_embeddings = captured.pop(layer)
+            blobs[layer] = layer_blob(
+                replica.readers[layer], hidden, position_embeddings, positions, self.extraction, name
+            )
+            del hidden, position_embeddings
+        return blobs
+
+
+def unit_bytes(document: Document) -> tuple[float, float]:
+    """Return what a document costs a token and a query row - its inputs over its keys, its targets over its rows.
+
+    Args:
+        document: A document, under the run's input.
+
+    Returns:
+        token_bytes: Bytes a position, of everything held for every position.
+        row_bytes: Bytes a query row, of everything held for every sampled row.
+    """
+    rows = len(document.query_positions)
+    row_bytes = sum(
+        tensor.numel() * tensor.element_size()
+        for tensor in document.tensors()
+        if tensor.ndim and tensor.shape[0] == rows and tensor.shape[0] != document.key_count
+    )
+    return (document.resident_bytes - row_bytes) / document.key_count, row_bytes / rows
+
+
+def teacher_devices(trainer_device: str | None) -> list[str]:
+    """Return where each copy of the teacher goes - every card the trainer's leaves, or the trainer's own.
+
+    Args:
+        trainer_device: The card the maps train on, or None on a node the trainer is not on.
+
+    Returns:
+        One card per copy, the trainer's own when the job has no other.
+    """
+    if trainer_device is None:
+        return [f"cuda:{index}" for index in range(torch.cuda.device_count())] or ["cpu"]
+    trainer = torch.device(trainer_device)
+    if trainer.type != "cuda":
+        return [trainer_device]
+    left = [f"cuda:{index}" for index in range(torch.cuda.device_count()) if index != (trainer.index or 0)]
+    return left or [trainer_device]
