@@ -1,0 +1,442 @@
+1]) + (sb[2] + sb[3]);
+  };
+  // later tiles: no row max; f0/f1 are the factors to apply to o once this tile's PV has landed
+  auto softmax_fast = [&](const unsigned x0, const unsigned x1, float& f0, float& f1) {
+#pragma unroll
+    for (int n = 0; n < 16; ++n) {
+      s[4 * n] = (x0 & (1u << (2 * n))) ? s[4 * n] : NEG;
+      s[4 * n + 1] = (x0 & (2u << (2 * n))) ? s[4 * n + 1] : NEG;
+      s[4 * n + 2] = (x1 & (1u << (2 * n))) ? s[4 * n + 2] : NEG;
+      s[4 * n + 3] = (x1 & (2u << (2 * n))) ? s[4 * n + 3] : NEG;
+    }
+    float sa[4], sb[4];
+#pragma unroll
+    for (int n = 0; n < 16; ++n) {
+      s[4 * n] = exp2f(fmaf(s[4 * n], sl2, -mu0));
+      s[4 * n + 1] = exp2f(fmaf(s[4 * n + 1], sl2, -mu0));
+      s[4 * n + 2] = exp2f(fmaf(s[4 * n + 2], sl2, -mu1));
+      s[4 * n + 3] = exp2f(fmaf(s[4 * n + 3], sl2, -mu1));
+      if (n < 4) { sa[n] = s[4 * n] + s[4 * n + 1]; sb[n] = s[4 * n + 2] + s[4 * n + 3]; }
+      else { sa[n & 3] += s[4 * n] + s[4 * n + 1]; sb[n & 3] += s[4 * n + 2] + s[4 * n + 3]; }
+    }
+    const float tl0 = (sa[0] + sa[1]) + (sa[2] + sa[3]), tl1 = (sb[0] + sb[1]) + (sb[2] + sb[3]);
+    l0 += tl0; l1 += tl1;
+    f0 = 1.f; f1 = 1.f;
+    if (__any_sync(0xffffffff, tl0 > 1048576.f || tl1 > 1048576.f)) {
+      // rare: a row's reference moves by 32; the decision is per row, i.e. uniform over the row's 4 lanes
+#ifdef NOQUADFIX
+      const bool b0 = tl0 > 1048576.f, b1 = tl1 > 1048576.f;
+#else
+      const unsigned qm = 0xFu << (lane & 28);
+      const bool b0 = __any_sync(qm, tl0 > 1048576.f), b1 = __any_sync(qm, tl1 > 1048576.f);
+#endif
+      if (b0) { f0 = 0x1p-32f; mu0 += 32.f; l0 *= f0; }
+      if (b1) { f1 = 0x1p-32f; mu1 += 32.f; l1 *= f1; }
+    }
+  };
+  auto pack_p = [&](unsigned (*pp)[4]) {
+#pragma unroll
+    for (int n = 0; n < 16; ++n) {
+      pp[n >> 1][(n & 1) * 2 + 0] = pack_bf16(s[4 * n], s[4 * n + 1]);
+      pp[n >> 1][(n & 1) * 2 + 1] = pack_bf16(s[4 * n + 2], s[4 * n + 3]);
+    }
+  };
+  auto rescale = [&](float c0, float c1) {
+    if (__any_sync(0xffffffff, c0 != 1.f || c1 != 1.f)) {
+#pragma unroll
+      for (int k2 = 0; k2 < NO / 4; ++k2) {
+        o[4 * k2] *= c0; o[4 * k2 + 1] *= c0; o[4 * k2 + 2] *= c1; o[4 * k2 + 3] *= c1;
+      }
+    }
+  };
+
+  for (int n = 0;; ++n) {
+    const int qb = n & 1;
+    mbar_wait(qinfo(qb), (n >> 1) & 1);
+    volatile int* sl = slot[qb];
+    const int it = sl[0], nd = sl[1], ng = sl[2], dm = sl[3];
+    if (it < 0) break;
+    const Item x = get_item(it, HB, HKV, nqblk, G, TG, window, sink);
+    const unsigned* P = PL + (size_t)it * planWords;
+    const int ngt = (ng + 127) >> 7;
+    const int nband = dm ? 0 : x.nband, wlo = x.wlo, pf = x.pf, NP = x.NP;
+    const int ntile = nband + nd + ngt;
+    const unsigned* MW = P + offM + qd;
+    const int rg0 = x.R0 + r0, rg1 = rg0 + 8;
+    const int i0 = min(rg0, TG - 1) / G, i1 = min(rg1, TG - 1) / G;
+    const unsigned sQ = sQb(qb);
+    const unsigned long long qdesc = qb ? qdesc1 : qdesc0;
+
+    auto arith = [&](int i, int kb0) -> unsigned {
+      const int lo = max(i - window + 1, kb0) - kb0, hi = min(i, kb0 + 127) - kb0;
+      const int shi = min(sink - 1, i) - kb0;
+      return perm_range(lo, hi, qd) | perm_range(0, shi, qd);
+    };
+    auto tile_mask = [&](int t, unsigned& a, unsigned& bm) {
+      if (t >= ntile) return;
+      if (t < nband) {
+        const int kb0 = wlo + t * 128;
+        a = arith(i0, kb0); bm = arith(i1, kb0);
+      } else {
+        const unsigned* mm = MW + (size_t)(t - nband) * NP * 4;
+        a = __ldg(mm + (i0 - pf) * 4); bm = __ldg(mm + (i1 - pf) * 4);
+      }
+    };
+
+#pragma unroll
+    for (int k2 = 0; k2 < NO; ++k2) o[k2] = 0.f;
+    mu0 = 32.f; mu1 = 32.f; l0 = 0.f; l1 = 0.f;
+    float pf0 = 1.f, pf1 = 1.f, f0, f1;   // pending o factors (this tile's shift applies after its PV)
+    unsigned mw0 = 0, mw1 = 0, nw0 = 0, nw1 = 0;
+    tile_mask(0, mw0, mw1);
+    tile_mask(1, nw0, nw1);
+    mbar_wait(qfull(qb), (n >> 1) & 1);
+    fence_proxy_async();
+#if PINGPONG
+    if (c == 1) bar_arrive(1, 256);
+#endif
+    {
+      mbar_wait(fullK(0), kuse0 & 1);
+      tile_fence();
+#if PINGPONG
+      bar_sync(my_bar, 256);
+#endif
+      wg_fence();
+      issue_S(qdesc, kdesc0);
+      wg_commit();
+#if PINGPONG
+      bar_arrive(other_bar, 256);
+#endif
+      wg_wait<0>();
+      fence_s();
+      mbar_arrive(emptyK(0));
+      softmax_first(mw0, mw1);
+      pack_p(p);
+      mw0 = nw0; mw1 = nw1;
+    }
+    // Tile t (t >= 1): S on K stage ST = t & 1, PV of tile t-1 on V stage SP = ST ^ 1.
+    int svp = 0, tvp = 0;   // V stage of tile t-1 and its index (t-1)/3 within the item
+    auto body = [&](auto stc, int t) {
+      constexpr int ST = decltype(stc)::value;
+      const int kp = ((ST ? kuse1 : kuse0) + (t >> 1)) & 1;
+      const int SP = svp;
+      const int vp = ((SP == 0 ? vuse0 : SP == 1 ? vuse1 : vuse2) + tvp) & 1;
+      TS(0);
+      mbar_wait(fullK(ST), kp);
+      mbar_wait(fullV(SP), vp);
+      TS(1);
+      tile_fence();
+      tile_mask(t + 1, nw0, nw1);
+#if PINGPONG
+      bar_sync(my_bar, 256);
+#endif
+      TS(2);
+      wg_fence();
+      issue_S(qdesc, ST ? kdesc1 : kdesc0);
+      wg_commit();
+      issue_PV(p, vdesc_of(SP));
+      wg_commit();
+#if PINGPONG
+      bar_arrive(other_bar, 256);
+#endif
+      TS(3);
+      wg_wait<1>();
+      fence_s();
+      TS(4);
+      mbar_arrive(emptyK(ST));
+      softmax_fast(mw0, mw1, f0, f1);
+      // anchor: a volatile shared store that depends on every exp (through the row sums) keeps ptxas from
+      // hoisting the PV wait above the softmax
+      asm volatile("st.shared.f32 [%0], %1;\n" :: "r"(anchor), "f"(l0 + l1) : "memory");
+      TS(5);
+      wg_wait<0>();
+      fence_op(p);
+      TS(6);
+      mbar_arrive(emptyV(SP));
+      rescale(pf0, pf1);
+      pf0 = f0; pf1 = f1;
+      pack_p(p);
+      mw0 = nw0; mw1 = nw1;
+      if (svp == 2) { svp = 0; ++tvp; } else ++svp;
+      TS(7);
+#ifdef TRACE
+      ++gtr;
+#endif
+    };
+    int t = 1;
+    for (; t + 1 < ntile; t += 2) { body(IC<1>{}, t); body(IC<0>{}, t + 1); }
+    if (t < ntile) body(IC<1>{}, t);
+    {
+      const int slv = svp;
+      const int vp = ((slv == 0 ? vuse0 : slv == 1 ? vuse1 : vuse2) + tvp) & 1;
+      mbar_wait(fullV(slv), vp);
+      tile_fence();
+#if PINGPONG
+      bar_sync(my_bar, 256);
+#endif
+      wg_fence();
+      issue_PV(p, vdesc_of(slv));
+      wg_commit();
+#if PINGPONG
+      if (c == 0) bar_arrive(other_bar, 256);
+#endif
+      wg_wait<0>();
+#pragma unroll
+      for (int k2 = 0; k2 < NO; ++k2) fence_reg(o[k2]);
+      mbar_arrive(emptyV(slv));
+      rescale(pf0, pf1);
+    }
+    kuse0 += (ntile + 1) >> 1; kuse1 += ntile >> 1; vuse0 += (ntile + 2) / 3; vuse1 += (ntile + 1) / 3; vuse2 += ntile / 3;
+    float L0 = l0, L1 = l1;
+    L0 += __shfl_xor_sync(0xffffffff, L0, 1);
+    L0 += __shfl_xor_sync(0xffffffff, L0, 2);
+    L1 += __shfl_xor_sync(0xffffffff, L1, 1);
+    L1 += __shfl_xor_sync(0xffffffff, L1, 2);
+    const float inv0 = L0 > 0.f ? 1.f / L0 : 0.f, inv1 = L1 > 0.f ? 1.f / L1 : 0.f;
+    // a row sum that is not finite means the fast path overflowed: flag the item for the exact fixup kernel
+#ifndef NOBADFLAG
+    if (__any_sync(0xffffffff, !(L0 < INFINITY) || !(L1 < INFINITY))) { if (lane == 0) bad[it] = epoch; }
+#endif
+    {
+      const int ra = r0, rb = r0 + 8;
+#pragma unroll
+      for (int k2 = 0; k2 < D / 8; ++k2) {
+        const unsigned pa = sQ + (k2 >> 3) * (BM * 128) + ra * 128 + (((k2 & 7) ^ (ra & 7)) << 4) + sh * 2;
+        const unsigned pb = sQ + (k2 >> 3) * (BM * 128) + rb * 128 + (((k2 & 7) ^ (rb & 7)) << 4) + sh * 2;
+        st_shared_u32(pa, pack_bf16(o[4 * k2] * inv0, o[4 * k2 + 1] * inv0));
+        st_shared_u32(pb, pack_bf16(o[4 * k2 + 2] * inv1, o[4 * k2 + 3] * inv1));
+      }
+    }
+    if ((lane & 3) == 0) {
+      if (rg0 < TG) {
+        const int i = rg0 / G, g = rg0 - i * G;
+        LSE[((size_t)x.b * HQ + x.hk * G + g) * T + i] = L0 > 0.f ? (mu0 + log2f(L0)) * 0.69314718055994531f : NEG;
+      }
+      if (rg1 < TG) {
+        const int i = rg1 / G, g = rg1 - i * G;
+        LSE[((size_t)x.b * HQ + x.hk * G + g) * T + i] = L1 > 0.f ? (mu1 + log2f(L1)) * 0.69314718055994531f : NEG;
+      }
+    }
+    if (useOT) {
+      fence_proxy_async();
+      bar_sync(5 + c, 128);
+      if (wtid == 0) {
+#pragma unroll
+        for (int p2 = 0; p2 < D / 64; ++p2) tma_store_4d(&tmO, sQ + p2 * (BM * 128) + c * 64 * 128, p2 * 64, x.hk * G, x.pf + c * (64 / G), x.b);
+        bulk_commit();
+        bulk_wait_read0();
+      }
+    } else {
+      bar_sync(5 + c, 128);
+#pragma unroll
+      for (int j = 0; j < (64 * CPR) / 128; ++j) {
+        const int xx = j * 128 + wtid;
+        const int lr = xx / CPR, ch = xx % CPR;
+        const int r = c * 64 + lr;
+        const int rg = x.R0 + r;
+        if (rg < TG) {
+          const int i = rg / G, g = rg - i * G;
+          const uint4 v = ld_shared_v4(sQ + (ch >> 3) * (BM * 128) + r * 128 + (((ch & 7) ^ (r & 7)) << 4));
+          *reinterpret_cast<uint4*>(O + ((size_t)(x.b * T + i) * HQ + x.hk * G + g) * D + ch * 8) = v;
+        }
+      }
+    }
+    mbar_arrive(qempty(qb));
+  }
+}
+"""
+
+HOST = r"""
+typedef CUresult (*EncodeFn)(CUtensorMap*, CUtensorMapDataType, cuuint32_t, void*, const cuuint64_t*,
+                             const cuuint64_t*, const cuuint32_t*, const cuuint32_t*, CUtensorMapInterleave,
+                             CUtensorMapSwizzle, CUtensorMapL2promotion, CUtensorMapFloatOOBfill);
+static EncodeFn get_encode() {
+  static EncodeFn fn = nullptr;
+  if (!fn) {
+    cudaDriverEntryPointQueryResult qres;
+    void* ptr = nullptr;
+    cudaGetDriverEntryPoint("cuTensorMapEncodeTiled", &ptr, cudaEnableDefault, &qres);
+    TORCH_CHECK(ptr != nullptr, "cuTensorMapEncodeTiled not found");
+    fn = (EncodeFn)ptr;
+  }
+  return fn;
+}
+struct MapCache { void* p = nullptr; int B = 0, T = 0, H = 0, D = 0, bh = 0, bt = 0; CUtensorMap m; };
+static const CUtensorMap& get_map(MapCache& c, void* ptr, int B, int T, int H, int D, int bh, int bt) {
+  if (c.p == ptr && c.B == B && c.T == T && c.H == H && c.D == D && c.bh == bh && c.bt == bt) return c.m;
+  cuuint64_t dims[4] = {(cuuint64_t)D, (cuuint64_t)H, (cuuint64_t)T, (cuuint64_t)B};
+  cuuint64_t strides[3] = {(cuuint64_t)D * 2, (cuuint64_t)H * D * 2, (cuuint64_t)T * H * D * 2};
+  cuuint32_t box[4] = {64, (cuuint32_t)bh, (cuuint32_t)bt, 1};
+  cuuint32_t es[4] = {1, 1, 1, 1};
+  CUresult r = get_encode()(&c.m, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, ptr, dims, strides, box, es,
+                            CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
+                            CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  TORCH_CHECK(r == CUDA_SUCCESS, "tensor map encode failed ", (int)r);
+  c.p = ptr; c.B = B; c.T = T; c.H = H; c.D = D; c.bh = bh; c.bt = bt;
+  return c.m;
+}
+static int num_sms() {
+  static int n = 0;
+  if (!n) {
+    int dev; cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev);
+  }
+  return n;
+}
+static int* get_bad(long n) {
+  static int* r = nullptr;
+  static long cap = 0;
+  if (n > cap) {
+    if (r) cudaFree(r);
+    cap = std::max<long>(n, 1 << 16);
+    cudaMalloc(&r, cap * 4); cudaMemset(r, 0, cap * 4);
+  }
+  return r;
+}
+static int next_epoch() {
+  static int e = 0;
+  return ++e;
+}
+static int* get_ctr() {
+  static int* c = nullptr;
+  if (!c) { cudaMalloc(&c, 64); cudaMemset(c, 0, 64); }
+  return c;
+}
+template <int D>
+void launch_attn(torch::Tensor q, torch::Tensor k, torch::Tensor v, const unsigned* pl, int* ctr, torch::Tensor o, torch::Tensor lse,
+                 int window, int sink, float sl2, int planWords, int offG, int offM, int grid, cudaStream_t stream, const int* gate, int gwant,
+                 int* bad, int epoch) {
+  const int B = q.size(0), T = q.size(1), HQ = q.size(2), HKV = k.size(2);
+  const int G = HQ / HKV;
+  constexpr int SM = KCfg<D>::SMEM;
+  static bool init = false;
+  if (!init) {
+    cudaFuncSetAttribute(attn_pers<D>, cudaFuncAttributeMaxDynamicSharedMemorySize, SM);
+    init = true;
+  }
+  MapCache ck, cv, cq;   // encoded on every call (no pointer-keyed caching)
+  const CUtensorMap& tk = get_map(ck, k.data_ptr(), B, T, HKV, D, 1, 128);
+  const CUtensorMap& tv = get_map(cv, v.data_ptr(), B, T, HKV, D, 1, 128);
+  const int useQT = (128 % G == 0) ? 1 : 0;
+  const CUtensorMap& tq = useQT ? get_map(cq, q.data_ptr(), B, T, HQ, D, G, 128 / G) : tk;
+  MapCache co;
+  const int useOT = (64 % G == 0) ? 1 : 0;
+  const CUtensorMap& to = useOT ? get_map(co, o.data_ptr(), B, T, HQ, D, G, 64 / G) : tk;
+  const int nqblk = (T * G + 127) / 128;
+  cudaLaunchConfig_t cfg = {};
+  cfg.gridDim = dim3(grid);
+  cfg.blockDim = dim3(384);
+  cfg.dynamicSmemBytes = SM;
+  cfg.stream = stream;
+  cudaLaunchAttribute attr[1];
+  attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attr[0].val.programmaticStreamSerializationAllowed = 1;
+  cfg.attrs = attr;
+  cfg.numAttrs = 1;
+  cudaError_t e = cudaLaunchKernelEx(&cfg, attn_pers<D>, tk, tv, tq, to,
+      reinterpret_cast<const bf16*>(q.data_ptr()), reinterpret_cast<const bf16*>(k.data_ptr()),
+      reinterpret_cast<const bf16*>(v.data_ptr()), pl, ctr,
+      reinterpret_cast<bf16*>(o.data_ptr()), lse.data_ptr<float>(), B, T, HQ, HKV, window, sink, sl2,
+      nqblk, planWords, offG, offM, useQT, useOT, gate, gwant, bad, epoch);
+  TORCH_CHECK(e == cudaSuccess, "launch failed ", cudaGetErrorString(e));
+}
+}  // namespace
+void sparse_fwd(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor sel,
+                torch::Tensor o, torch::Tensor lse, int64_t window, int64_t sink, double scale, int64_t thr, double dfac, torch::Tensor gate_t, int64_t want) {
+  const int* gate = gate_t.numel() ? gate_t.data_ptr<int>() : nullptr;
+  const int B = q.size(0), T = q.size(1), D = q.size(3), HQ = q.size(2);
+  const int HKV = k.size(2), TOPK = sel.size(3);
+  const int G = HQ / HKV;
+  const int nqblk = (T * G + 127) / 128;
+  const int HB = HKV * B;
+  const long nItems = (long)nqblk * HB;
+  const int grid = (int)std::min<long>(nItems, num_sms());
+  const long nb = (T + 127) / 128;
+  const long NPM = 127 / G + 2;
+  const int THR = (int)std::max<int64_t>(1, thr);
+  long ngmax = std::min<long>(nb * 128, NPM * TOPK + sink + 128);
+  long ngtmax = (ngmax + 127) / 128;
+  const long nbandmax = window > 0 ? (window + NPM) / 128 + 2 : 0;
+  const long tm1 = ngmax / THR + 2;
+  const long tm2 = (long)std::ceil(dfac * (double)(nbandmax + ngtmax)) + 2;
+  long tilesmax = std::min<long>(nb, std::max<long>(tm1, tm2));
+  const long offG = (4 + nb + 3) & ~3L;
+  const long offM = offG + ngtmax * 128;
+  const long maskWords = tilesmax * NPM * 4;
+  const long planWords = (offM + maskWords + 3) & ~3L;
+  auto plan = torch::empty({nItems * planWords}, q.options().dtype(torch::kInt32));
+  unsigned* pl = reinterpret_cast<unsigned*>(plan.data_ptr());
+  int* ctr = get_ctr();
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const long smw = ((2 * nb * 4 + nb + 3) & ~3L) + 2 * nb * 4;
+  const long psmB = (smw + (long)MTS * NPM * 4) * 4;
+  if (psmB <= 200 * 1024) {
+    static long pset = 0;
+    if (psmB > pset) {
+      cudaFuncSetAttribute(plan_k2<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)psmB);
+      pset = psmB;
+    }
+    plan_k2<false><<<(int)nItems, 256, psmB, stream>>>(sel.data_ptr<int>(), pl, ctr, T, HKV, G, TOPK, (int)window, (int)sink,
+        THR, nqblk, HB, (int)planWords, (int)offG, (int)offM, (float)dfac, gate, (int)want);
+  } else {
+    const long b2 = smw * 4;
+    static long pset2 = 0;
+    if (b2 > pset2) {
+      cudaFuncSetAttribute(plan_k2<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)b2);
+      pset2 = b2;
+    }
+    plan_k2<true><<<(int)nItems, 256, b2, stream>>>(sel.data_ptr<int>(), pl, ctr, T, HKV, G, TOPK, (int)window, (int)sink,
+        THR, nqblk, HB, (int)planWords, (int)offG, (int)offM, (float)dfac, gate, (int)want);
+  }
+  const float sl2 = (float)(scale * 1.4426950408889634);
+  int* bad = get_bad(nItems);
+  const int epoch = next_epoch();
+  TORCH_CHECK(D == 128, "d=128 only");
+  launch_attn<128>(q, k, v, pl, ctr, o, lse, (int)window, (int)sink, sl2, (int)planWords, (int)offG, (int)offM, grid, stream, gate, (int)want, bad, epoch);
+  // exact recomputation of flagged items (none for sane logits); a gated-off pipeline flags nothing
+#ifndef NOFIXUP
+  fixup_k<<<32, 128, 0, stream>>>(reinterpret_cast<const bf16*>(q.data_ptr()), reinterpret_cast<const bf16*>(k.data_ptr()),
+      reinterpret_cast<const bf16*>(v.data_ptr()), pl, reinterpret_cast<bf16*>(o.data_ptr()), lse.data_ptr<float>(), bad, epoch, (int)nItems,
+      B, T, HQ, HKV, (int)window, (int)sink, (float)scale, nqblk, (int)planWords, (int)offG, (int)offM);
+#endif
+}
+"""
+
+DEV = HEADER + _gen(128, False) + _gen(128, True) + _gen(64, True) + KERN
+
+_ext = load_inline(
+    name="lsa_fwd_hard_union",
+    cpp_sources="void sparse_fwd(torch::Tensor q, torch::Tensor k, torch::Tensor v, "
+    "torch::Tensor sel, torch::Tensor o, torch::Tensor lse, int64_t window, int64_t sink, double scale, int64_t thr, double dfac, torch::Tensor gate_t, int64_t want);",
+    cuda_sources=DEV + HOST,
+    functions=["sparse_fwd"],
+    extra_cuda_cflags=["-O3", "--use_fast_math", "-gencode=arch=compute_90a,code=sm_90a"],
+)
+
+THR = 112
+DFAC = 1.0
+
+
+_NG = {}
+
+
+def _nogate(dev):
+    if dev not in _NG:
+        _NG[dev] = torch.empty(0, dtype=torch.int32, device=dev)
+    return _NG[dev]
+
+
+def attention(q, k, v, selected, window=0, sink=0, scale=None):
+    b, t, hq, d = q.shape
+    scale = d ** -0.5 if scale is None else scale
+    q = q.contiguous(); k = k.contiguous(); v = v.contiguous()
+    selected = selected.contiguous()
+    if selected.dtype != torch.int32:
+        selected = selected.to(torch.int32)
+    o = torch.empty_like(q)
+    lse = torch.empty(b, hq, t, dtype=torch.float32, device=q.device)
+    _ext.sparse_fwd(q, k, v, selected, o, lse, int(window), int(sink), float(scale), THR, DFAC, _nogate(q.device), 0)
+    return o, lse
+
+
+attention_sorted = attention
