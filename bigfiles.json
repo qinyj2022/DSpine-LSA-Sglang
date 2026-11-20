@@ -1,0 +1,310 @@
+{
+ "note": "large files stored split; run tools/join_parts.py to rebuild",
+ "files": {
+  "patches/lsa/core/kernels/cutedsl/beam.py": [
+   "patches/lsa/core/kernels/cutedsl/beam.py.part000",
+   "patches/lsa/core/kernels/cutedsl/beam.py.part001"
+  ],
+  "patches/lsa/core/kernels/cutedsl/decode.py": [
+   "patches/lsa/core/kernels/cutedsl/decode.py.part000",
+   "patches/lsa/core/kernels/cutedsl/decode.py.part001"
+  ],
+  "patches/lsa/core/kernels/cutedsl/expansion.py": [
+   "patches/lsa/core/kernels/cutedsl/expansion.py.part000",
+   "patches/lsa/core/kernels/cutedsl/expansion.py.part001"
+  ],
+  "patches/lsa/core/kernels/cutedsl/thresholds.py": [
+   "patches/lsa/core/kernels/cutedsl/thresholds.py.part000",
+   "patches/lsa/core/kernels/cutedsl/thresholds.py.part001"
+  ],
+  "patches/lsa/core/kernels/triton/beam.py": [
+   "patches/lsa/core/kernels/triton/beam.py.part000",
+   "patches/lsa/core/kernels/triton/beam.py.part001"
+  ],
+  "patches/lsa/evaluation/accuracy/runner.py": [
+   "patches/lsa/evaluation/accuracy/runner.py.part000",
+   "patches/lsa/evaluation/accuracy/runner.py.part001"
+  ],
+  "patches/lsa/evaluation/performance/kernels/measure/layer.py": [
+   "patches/lsa/evaluation/performance/kernels/measure/layer.py.part000",
+   "patches/lsa/evaluation/performance/kernels/measure/layer.py.part001"
+  ],
+  "patches/lsa/evaluation/performance/roofline/page.html": [
+   "patches/lsa/evaluation/performance/roofline/page.html.part000",
+   "patches/lsa/evaluation/performance/roofline/page.html.part001",
+   "patches/lsa/evaluation/performance/roofline/page.html.part002",
+   "patches/lsa/evaluation/performance/roofline/page.html.part003"
+  ],
+  "patches/lsa/sglang/index/pisa.py": [
+   "patches/lsa/sglang/index/pisa.py.part000",
+   "patches/lsa/sglang/index/pisa.py.part001"
+  ],
+  "patches/lsa/sglang/plugin.py": [
+   "patches/lsa/sglang/plugin.py.part000",
+   "patches/lsa/sglang/plugin.py.part001"
+  ],
+  "patches/lsa/training/distillation/data/online.py": [
+   "patches/lsa/training/distillation/data/online.py.part000",
+   "patches/lsa/training/distillation/data/online.py.part001"
+  ],
+  "patches/lsa/training/native/kernels/dsa_sparse/topk.py": [
+   "patches/lsa/training/native/kernels/dsa_sparse/topk.py.part000",
+   "patches/lsa/training/native/kernels/dsa_sparse/topk.py.part001"
+  ],
+  "patches/lsa/training/native/kernels/gather_sparse.py": [
+   "patches/lsa/training/native/kernels/gather_sparse.py.part000",
+   "patches/lsa/training/native/kernels/gather_sparse.py.part001"
+  ],
+  "patches/lsa/training/native/kernels/vendor/bwd_hybrid_kernel.py": [
+   "patches/lsa/training/native/kernels/vendor/bwd_hybrid_kernel.py.part000",
+   "patches/lsa/training/native/kernels/vendor/bwd_hybrid_kernel.py.part001"
+  ],
+  "patches/lsa/training/native/kernels/vendor/bwd_v14.py": [
+   "patches/lsa/training/native/kernels/vendor/bwd_v14.py.part000",
+   "patches/lsa/training/native/kernels/vendor/bwd_v14.py.part001"
+  ],
+  "patches/lsa/training/native/kernels/vendor/fa3idx.py": [
+   "patches/lsa/training/native/kernels/vendor/fa3idx.py.part000",
+   "patches/lsa/training/native/kernels/vendor/fa3idx.py.part001"
+  ],
+  "patches/lsa/training/native/kernels/vendor/fwd_hard_split.py": [
+   "patches/lsa/training/native/kernels/vendor/fwd_hard_split.py.part000",
+   "patches/lsa/training/native/kernels/vendor/fwd_hard_split.py.part001"
+  ],
+  "patches/lsa/training/native/kernels/vendor/fwd_hard_union.py": [
+   "patches/lsa/training/native/kernels/vendor/fwd_hard_union.py.part000",
+   "patches/lsa/training/native/kernels/vendor/fwd_hard_union.py.part001"
+  ],
+  "patches/lsa/training/native/kernels/vendor/fwd_hq16_hkv2.py": [
+   "patches/lsa/training/native/kernels/vendor/fwd_hq16_hkv2.py.part000",
+   "patches/lsa/training/native/kernels/vendor/fwd_hq16_hkv2.py.part001"
+  ],
+  "src/dspine_code/DSpine-main/asset/overview.png": [
+   "src/dspine_code/DSpine-main/asset/overview.png.part000",
+   "src/dspine_code/DSpine-main/asset/overview.png.part001",
+   "src/dspine_code/DSpine-main/asset/overview.png.part002",
+   "src/dspine_code/DSpine-main/asset/overview.png.part003",
+   "src/dspine_code/DSpine-main/asset/overview.png.part004",
+   "src/dspine_code/DSpine-main/asset/overview.png.part005",
+   "src/dspine_code/DSpine-main/asset/overview.png.part006",
+   "src/dspine_code/DSpine-main/asset/overview.png.part007",
+   "src/dspine_code/DSpine-main/asset/overview.png.part008",
+   "src/dspine_code/DSpine-main/asset/overview.png.part009",
+   "src/dspine_code/DSpine-main/asset/overview.png.part010",
+   "src/dspine_code/DSpine-main/asset/overview.png.part011",
+   "src/dspine_code/DSpine-main/asset/overview.png.part012",
+   "src/dspine_code/DSpine-main/asset/overview.png.part013",
+   "src/dspine_code/DSpine-main/asset/overview.png.part014"
+  ],
+  "src/dspine_code/DSpine-main/sglang_dspine/verification/calibration.json": [
+   "src/dspine_code/DSpine-main/sglang_dspine/verification/calibration.json.part000",
+   "src/dspine_code/DSpine-main/sglang_dspine/verification/calibration.json.part001",
+   "src/dspine_code/DSpine-main/sglang_dspine/verification/calibration.json.part002",
+   "src/dspine_code/DSpine-main/sglang_dspine/verification/calibration.json.part003",
+   "src/dspine_code/DSpine-main/sglang_dspine/verification/calibration.json.part004",
+   "src/dspine_code/DSpine-main/sglang_dspine/verification/calibration.json.part005",
+   "src/dspine_code/DSpine-main/sglang_dspine/verification/calibration.json.part006",
+   "src/dspine_code/DSpine-main/sglang_dspine/verification/calibration.json.part007",
+   "src/dspine_code/DSpine-main/sglang_dspine/verification/calibration.json.part008",
+   "src/dspine_code/DSpine-main/sglang_dspine/verification/calibration.json.part009",
+   "src/dspine_code/DSpine-main/sglang_dspine/verification/calibration.json.part010",
+   "src/dspine_code/DSpine-main/sglang_dspine/verification/calibration.json.part011",
+   "src/dspine_code/DSpine-main/sglang_dspine/verification/calibration.json.part012",
+   "src/dspine_code/DSpine-main/sglang_dspine/verification/calibration.json.part013",
+   "src/dspine_code/DSpine-main/sglang_dspine/verification/calibration.json.part014",
+   "src/dspine_code/DSpine-main/sglang_dspine/verification/calibration.json.part015"
+  ],
+  "src/lsa_code/gen16k.json": [
+   "src/lsa_code/gen16k.json.part000",
+   "src/lsa_code/gen16k.json.part001",
+   "src/lsa_code/gen16k.json.part002"
+  ],
+  "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt": [
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part000",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part001",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part002",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part003",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part004",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part005",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part006",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part007",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part008",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part009",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part010",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part011",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part012",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part013",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part014",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part015",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part016",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part017",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part018",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part019",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part020",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part021",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part022",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part023",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part024",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part025",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part026",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part027",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part028",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part029",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part030",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part031",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part032",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part033",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part034",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part035",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part036",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part037",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part038",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part039",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part040",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part041",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part042",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part043",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part044",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part045",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part046",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part047",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part048",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part049",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part050",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part051",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part052",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part053",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part054",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part055",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part056",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part057",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part058",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part059",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part060",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part061",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part062",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part063",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part064",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part065",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part066",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part067",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part068",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part069",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part070",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part071",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part072",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part073",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part074",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part075",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part076",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part077",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part078",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part079",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part080",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part081",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part082",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part083",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part084",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part085",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part086",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part087",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part088",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part089",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part090",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part091",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part092",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part093",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part094",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part095",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part096",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part097",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part098",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part099",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part100",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part101",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part102",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part103",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part104",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part105",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part106",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part107",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part108",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part109",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part110",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part111",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part112",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part113",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part114",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part115",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part116",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part117",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part118",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part119",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part120",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part121",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part122",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part123",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part124",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part125",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part126",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part127",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part128",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part129",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part130",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part131",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part132",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part133",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part134",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part135",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part136",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part137",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part138",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part139",
+   "src/lsa_code/maps/qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt.part140"
+  ],
+  "src/lsa_code/n16k.json": [
+   "src/lsa_code/n16k.json.part000",
+   "src/lsa_code/n16k.json.part001",
+   "src/lsa_code/n16k.json.part002"
+  ],
+  "src/lsa_code/n16k_gen.json": [
+   "src/lsa_code/n16k_gen.json.part000",
+   "src/lsa_code/n16k_gen.json.part001",
+   "src/lsa_code/n16k_gen.json.part002"
+  ],
+  "src/lsa_code/n8k.json": [
+   "src/lsa_code/n8k.json.part000",
+   "src/lsa_code/n8k.json.part001"
+  ],
+  "src/lsa_code/p30k.json": [
+   "src/lsa_code/p30k.json.part000",
+   "src/lsa_code/p30k.json.part001",
+   "src/lsa_code/p30k.json.part002",
+   "src/lsa_code/p30k.json.part003"
+  ],
+  "src/lsa_code/s12000.json": [
+   "src/lsa_code/s12000.json.part000",
+   "src/lsa_code/s12000.json.part001"
+  ],
+  "src/lsa_code/s16000.json": [
+   "src/lsa_code/s16000.json.part000",
+   "src/lsa_code/s16000.json.part001",
+   "src/lsa_code/s16000.json.part002"
+  ],
+  "src/lsa_code/s20000.json": [
+   "src/lsa_code/s20000.json.part000",
+   "src/lsa_code/s20000.json.part001",
+   "src/lsa_code/s20000.json.part002"
+  ],
+  "src/lsa_code/s30000.json": [
+   "src/lsa_code/s30000.json.part000",
+   "src/lsa_code/s30000.json.part001",
+   "src/lsa_code/s30000.json.part002",
+   "src/lsa_code/s30000.json.part003"
+  ],
+  "src/lsa_code/s8000.json": [
+   "src/lsa_code/s8000.json.part000",
+   "src/lsa_code/s8000.json.part001"
+  ]
+ }
+}
