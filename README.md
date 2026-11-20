@@ -366,3 +366,21 @@ Mamba cache 是 48 个线性注意力层的循环状态，**与是否用 DSpine 
 
 上游项目未 vendor 进本仓库；`patches/lsa/` 只包含带补丁标记的改动文件。
 DSpine 与 LSA 的著作权归各自作者所有。详见 [`NOTICE.md`](NOTICE.md)。
+
+---
+
+## 附：上传分片文件
+
+本仓库的发布网络路径上，**任何超过约 64 KiB 的请求体都会被中间设备切断**（`git push` 整包、
+`git-receive-api` 大 blob、SSH 大 pack 全部失败）。因此：
+
+- 每个文件都以**独立请求逐文件上传**（685 个源文件 → 895 次请求）；
+- 超过 45 KB 的 **32 个文件**被切成 `<原路径>.partNNN` 分片存放，清单见根目录 `bigfiles.json`。
+
+在本机克隆后执行一次即可还原原文件：
+
+```bash
+python tools/join_parts.py .
+```
+
+分片文件保留不影响任何东西，可以按需删除。
