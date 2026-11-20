@@ -1,0 +1,243 @@
+[B, T, H_kv, D].
+        v: Values [B, T, H_kv, D].
+        o: The forward's output like q.
+        lse: The forward's log-sum-exp [B, H_q, T] fp32.
+        indices: Selected key positions [B, T, top_k] int32, PAD (-1) anywhere.
+        members: LSA bucket members, which group a query's listed keys into runs - 16 positions when None.
+        window_size: Recent keys each query reads.
+        sink_size: First keys each query reads.
+        scale: The factor logits are scaled by.
+        dlse: Gradient of the log-sum-exp [B, H_q, T], when it is used downstream.
+
+    Returns:
+        The gradients of q, k and v.
+    """
+    b, t, h_q, d = q.shape
+    h_kv = k.shape[2]
+    q, k, v, do = _unit_stride(q), _unit_stride(k), _unit_stride(v), _unit_stride(do)
+    indices = _unit_stride(indices)
+    delta = torch.empty(b, h_q, t, dtype=torch.float32, device=q.device)
+    block_t = max(16, 4096 // triton.next_power_of_2(d))
+    _delta_kernel[(triton.cdiv(t, block_t), b * h_q)](
+        o, do, delta, *_strides(o), *_strides(do), h_q, t,
+        HEAD_DIM=d, BLOCK_D=triton.next_power_of_2(d), BLOCK_T=block_t,
+    )  # fmt: skip
+    if dlse is not None:
+        # A log-sum-exp gradient adds g * p to a score's, which is p * (dp - delta) at delta - g
+        delta -= dlse.float()
+    dq = torch.empty(q.shape, dtype=q.dtype, device=q.device)
+    dk = torch.empty(k.shape, dtype=k.dtype, device=k.device)
+    dv = torch.empty(v.shape, dtype=v.dtype, device=v.device)
+    dk32 = torch.zeros(k.shape, dtype=torch.float32, device=k.device)
+    dv32 = torch.zeros(k.shape, dtype=torch.float32, device=k.device)
+    shape = _shape(q, k, indices, DQ_GATHER)
+    group = shape.pop("group")
+    sink_n = max(16, triton.next_power_of_2(sink_size))
+    warps, stages = BLACKWELL_DQ_LAUNCH if _blackwell(q.device) else DQ_LAUNCH
+    scatter = BACKWARD == "scatter"
+    _dq_kernel[(triton.cdiv(t, shape['G']), b * h_kv)](
+        q, k, v, do, lse, delta, indices, dq, dk32, dv32,
+        *_strides(q), *_strides(k), *_strides(v), *_strides(do), *_strides(dq),
+        indices.stride(0), indices.stride(1), *_strides(dk32),
+        h_q, h_kv, group, t, scale * LOG2E, scale,
+        WINDOW=window_size, SINK=sink_size, BLOCK_N=BLOCK_N, SINK_N=sink_n, SCATTER=scatter,
+        num_warps=warps, num_stages=stages, **shape,
+    )  # fmt: skip
+    if not scatter:
+        _key_side(
+            q, k, v, do, lse, delta, indices, members, dk32, dv32, window_size, sink_size, scale,
+            shape['HP'],
+        )  # fmt: skip
+    common = dict(
+        HEAD_DIM=d, BLOCK_D=shape['BLOCK_D'], HP=shape['HP'], WINDOW=window_size, SINK=sink_size,
+        ROWS=max(DKV_ROWS, shape['HP']), **_dkv_launch(q.device, shape['BLOCK_D']),
+    )  # fmt: skip
+    args = (
+        q, k, v, do, lse, delta, dk32, dv32, dk, dv,
+        *_strides(q), *_strides(k), *_strides(v), *_strides(do), *_strides(dk32), *_strides(dk),
+        h_q, h_kv, group, t, scale * LOG2E, scale,
+    )  # fmt: skip
+    if sink_size:
+        chunk = max(1, SINK_ROWS // shape["HP"])
+        _dkv_kernel[(triton.cdiv(t, chunk), b * h_kv)](
+            *args, SINK_ONLY=True, BLOCK_N=sink_n, CHUNK=chunk, **common
+        )
+    _dkv_kernel[(triton.cdiv(t, BLOCK_N), b * h_kv)](
+        *args, SINK_ONLY=False, BLOCK_N=BLOCK_N, CHUNK=1, **common
+    )
+    return dq, dk, dv
+
+
+@torch.library.custom_op("lsa::gather_sparse_attention", mutates_args=())
+def gather_attention_op(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    indices: torch.Tensor,
+    members: torch.Tensor | None,
+    window_size: int,
+    sink_size: int,
+    scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run attention over gathered selected keys; see gather_sparse.attention."""
+    return _forward(q, k, v, indices, window_size, sink_size, scale)
+
+
+@gather_attention_op.register_fake
+def _(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    indices: torch.Tensor,
+    members: torch.Tensor | None,
+    window_size: int,
+    sink_size: int,
+    scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return an empty output like q and an empty log-sum-exp [B, H_q, T] fp32."""
+    b, t, h_q, _ = q.shape
+    return q.new_empty(q.shape), q.new_empty((b, h_q, t), dtype=torch.float32)
+
+
+@torch.library.custom_op("lsa::gather_sparse_attention_backward", mutates_args=())
+def gather_attention_backward_op(
+    do: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    o: torch.Tensor,
+    lse: torch.Tensor,
+    indices: torch.Tensor,
+    members: torch.Tensor | None,
+    window_size: int,
+    sink_size: int,
+    scale: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute dq, dk and dv of gather_attention_op."""
+    return _backward(do, q, k, v, o, lse, indices, members, window_size, sink_size, scale)
+
+
+@gather_attention_backward_op.register_fake
+def _(
+    do: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    o: torch.Tensor,
+    lse: torch.Tensor,
+    indices: torch.Tensor,
+    members: torch.Tensor | None,
+    window_size: int,
+    sink_size: int,
+    scale: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return empty gradients like q, k and v."""
+    return q.new_empty(q.shape), k.new_empty(k.shape), v.new_empty(v.shape)
+
+
+def _setup_context(ctx: Any, inputs: tuple[Any, ...], output: Any) -> None:
+    """Save the tensors and settings the backward needs."""
+    q, k, v, indices, members, window_size, sink_size, scale = inputs
+    o, lse = output
+    ctx.save_for_backward(q, k, v, o, lse, indices, members)
+    ctx.window_size, ctx.sink_size, ctx.scale = window_size, sink_size, scale
+
+
+def _autograd_backward(ctx: Any, do: torch.Tensor, _dlse: torch.Tensor) -> tuple[torch.Tensor | None, ...]:
+    """Return the gradients of q, k and v, and none for the other inputs."""
+    q, k, v, o, lse, indices, members = ctx.saved_tensors
+    dq, dk, dv = gather_attention_backward_op(
+        do, q, k, v, o, lse, indices, members, ctx.window_size, ctx.sink_size, ctx.scale
+    )
+    return dq, dk, dv, None, None, None, None, None
+
+
+gather_attention_op.register_autograd(_autograd_backward, setup_context=_setup_context)
+
+
+def attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    indices: torch.Tensor,
+    window_size: int,
+    sink_size: int,
+    scale: float,
+    members: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run causal softmax attention over each query's window_size, sink_size and selected keys.
+
+    Query i, at position i, keeps keys j with 0 <= i - j < window_size, j < sink_size, and the positions indices lists for it that lie in [sink_size, i - window_size] in its first i - window_size - sink_size + 1 slots, the most distinct positions it can keep.
+    That is as dsa_sparse.attention keeps a Selection of the same keys.
+    Under autocast q, k and v are cast to its dtype.
+
+    Args:
+        q: Queries [b, t, h_q, d].
+        k: Keys [b, t, h_kv, d], h_kv dividing h_q - query head h reads key head h // (h_q // h_kv).
+        v: Values [b, t, h_kv, d].
+        indices: Key positions [b, t, top_k] int32 or int64, one selection every head reads, PAD (-1) or any position out of range taking none.
+            They are lsa_select.select_indices'.
+        window_size: Keys a query's window_size holds, itself included.
+        sink_size: Leading keys every query keeps.
+        scale: The scores' scale.
+        members: LSA's [b, m, cap] buckets of key positions, PAD past a bucket's size, cap at most 32, which the backward reads the selected keys' gradients by.
+            A query's consecutive listed keys of one bucket, in position order, are one run of it.
+            None groups consecutive positions instead, right for any selection but slower for LSA's.
+
+    Returns:
+        The [b, t, h_q, d] context and the [b, h_q, t] fp32 log-sum-exp of the scaled scores, which carries no gradient.
+    """
+    if torch.is_autocast_enabled("cuda"):
+        dtype = torch.get_autocast_dtype("cuda")
+        q, k, v = q.to(dtype), k.to(dtype), v.to(dtype)
+    b, t, h_q, d = q.shape
+    if d not in HEAD_DIMS:
+        raise ValueError(f"head_dim {d} is not one of {HEAD_DIMS}")
+    if q.dtype not in DTYPES or k.dtype != q.dtype or v.dtype != q.dtype:
+        raise ValueError(f"attention needs q, k and v of one dtype of {DTYPES}")
+    if h_q % k.shape[2] or k.shape != v.shape or k.shape[:2] != (b, t) or k.shape[3] != d:
+        raise ValueError(f"q {tuple(q.shape)} does not group over k and v {tuple(k.shape)}")
+    if indices.shape[:2] != (b, t) or indices.dim() != 3:
+        raise ValueError(f"indices {tuple(indices.shape)} are not (b, t, top_k) for q")
+    if indices.dtype not in (torch.int32, torch.int64):
+        raise ValueError(f"indices must be int32 or int64, got {indices.dtype}")
+    if members is not None and (members.dim() != 3 or len(members) != b or members.shape[2] > 32):
+        raise ValueError(f"members {tuple(members.shape)} are not (b, m, cap <= 32) for q")
+    with torch.autocast("cuda", enabled=False):
+        o, lse = gather_attention_op(q, k, v, indices, members, window_size, sink_size, scale)
+    return o, lse.detach()
+
+
+def log_mass_gradients(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    indices: torch.Tensor,
+    members: torch.Tensor | None,
+    lse: torch.Tensor,
+    dlse: torch.Tensor,
+    window_size: int,
+    sink_size: int,
+    scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Backpropagate a gradient of the read's log-sum-exp into its queries and keys.
+
+    The backward kernels take a zero output gradient and a delta shifted by `dlse`, so the scores' gradient is `dlse` times each probability.
+
+    Args:
+        q: Queries [b, t, h_q, d] bf16 or fp16.
+        k: Keys [b, t, h_kv, d] of q's dtype.
+        indices: The read's selection, as `attention` takes it.
+        members: The read's buckets, as `attention` takes them.
+        lse: The read's log-sum-exp [b, h_q, t] fp32.
+        dlse: Gradient of the log-sum-exp [b, h_q, t].
+        window_size: Keys a query's window holds, itself included.
+        sink_size: Leading keys every query keeps.
+        scale: The scores' scale.
+
+    Returns:
+        Gradient of the queries [b, t, h_q, d] in q's dtype.
+        Gradient of the keys [b, t, h_kv, d] in k's dtype.
+    """
+    zero = torch.zeros_like(q)
+    dq, dk, _ = _backward(zero, q, k, k, zero, lse, indices, members, window_size, sink_size, scale, dlse)
+    return dq, dk
