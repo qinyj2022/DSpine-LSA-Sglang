@@ -1,0 +1,14 @@
+﻿__pycache__/
+*.pyc
+*.pyo
+*.so
+*.log
+*.out
+*.tgz
+*.tar.gz
+*.safetensors
+*.bin
+*.docx
+.pytest_cache/
+.DS_Store
+latent-sparse-attention/
