@@ -1,0 +1,94 @@
+      Keys each request lists [B] int32.
+
+    Raises:
+        ValueError: If the rows are not ones `supports` takes.
+    """
+    if not supports(index_queries, bucket_centroids, max_rows):
+        raise ValueError(
+            "the CuTeDSL decode select takes contiguous, 16-byte aligned bf16 rows of 64 index dims and at most "
+            f"{CuteDecode.MOST_SPANS * CuteDecode.SPAN} buckets a request - got {index_queries.dtype} {tuple(index_queries.shape)} and "
+            f"{bucket_centroids.dtype} {tuple(bucket_centroids.shape)} for {max_rows} buckets"
+        )
+    batch = index_queries.shape[0]
+    device = index_queries.device
+    samples, stride, target, capacity = keep_plan(top_p, max_rows)
+    capacity = max(capacity, top_p)
+    words = torch.empty(batch, samples, device=device, dtype=torch.int32)
+    thresholds = torch.empty(batch, device=device, dtype=torch.float32)
+    listed = torch.empty(batch, device=device, dtype=torch.int32)
+    scores = torch.empty(batch, max_rows, device=device, dtype=torch.float32)
+    keys = torch.empty(batch, capacity, device=device, dtype=torch.int64)
+    staged = torch.empty(batch, capacity, device=device, dtype=torch.int64)
+    spans = -(-max_rows // CuteDecode.SPAN)
+    span_counts = torch.empty(batch, spans, device=device, dtype=torch.int32)
+    span_offsets = torch.empty(batch, spans, device=device, dtype=torch.int32)
+    compiled("sample", page_rows)(index_queries, bucket_centroids, pages, counts, words, stride)
+    compiled("threshold", page_rows)(counts, words, thresholds, listed, stride, top_p, target, capacity)
+    compiled("scan", page_rows)(
+        index_queries,
+        bucket_centroids,
+        pages,
+        counts,
+        thresholds,
+        scores,
+        staged,
+        span_counts,
+        span_offsets,
+        listed,
+    )
+    compiled("order", page_rows)(scores, counts, staged, span_counts, span_offsets, keys, listed, top_p)
+    return keys, listed
+
+
+class DecodeSelect:
+    """A flat decode step's listing in CuTeDSL, and the best buckets a check picks from it."""
+
+    def __init__(self, top_p: int) -> None:
+        """Fix the buckets a read takes at most.
+
+        Args:
+            top_p: Buckets the read takes at most.
+        """
+        self.top_p = top_p
+
+    def listed(
+        self,
+        index_queries: torch.Tensor,
+        bucket_centroids: torch.Tensor,
+        pages: torch.Tensor,
+        counts: torch.Tensor,
+        page_rows: int,
+        max_rows: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """List each request's buckets that hold its top-p - `decode_listing` with this select's top-p.
+
+        Args:
+            index_queries: One index query a request [B, index_dim] bf16.
+            bucket_centroids: The cache's bucket centroids [rows, index_dim] bf16.
+            pages: Each request's pages [B, max_pages] int32, -1 for none.
+            counts: Buckets each request sees [B] int32.
+            page_rows: Cache rows a page holds.
+            max_rows: Buckets a request may see.
+
+        Returns:
+            Packed keys [B, capacity] int64 holding each request's top-p, in bucket order, and keys each lists [B] int32.
+        """
+        return decode_listing(index_queries, bucket_centroids, pages, counts, page_rows, max_rows, self.top_p)
+
+    def pick(self, listing: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+        """Pick each request's best buckets from a listing.
+
+        Args:
+            listing: Packed keys [B, capacity] int64 and keys each request lists [B] int32.
+
+        Returns:
+            Buckets [B, top_p] int32, the best score first and a tie to the lower bucket, -1 past a request's count.
+        """
+        keys, listed = listing
+        width = keys.shape[1]
+        held = torch.arange(width, device=keys.device)[None] < listed[:, None]
+        best = keys.masked_fill(~held, PackedKey.EMPTY).topk(min(self.top_p, width), dim=1).values
+        buckets = (0x7FFFFFFF - (best & 0xFFFFFFFF)).int()
+        picked = torch.full((keys.shape[0], self.top_p), -1, device=keys.device, dtype=torch.int32)
+        picked[:, : best.shape[1]] = torch.where(best == PackedKey.EMPTY, -1, buckets)
+        return picked
