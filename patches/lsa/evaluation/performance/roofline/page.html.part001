@@ -1,0 +1,661 @@
+M] fp32, staged keys, span counts",
+    launch: "One CTA per span of 256 buckets",
+    hw: ["paged loads", "one global atomic per span", "shuffles"],
+    cost: ["FLOPs: 2 d M = 2 x 64 x 1.31M = 0.17 GFLOP at B = 1", "Bytes: M x 128 B = 168 MB, about 170 MB at 10M"],
+    bound: "HBM. Each request streams its own centroids." },
+  { id: "dorder", stage: "decode", cls: "decode.Order", short: "Decode order", steps: [{ step: "decode select", match: ["order"] }],
+    does: "Concatenates the staged spans in bucket order: a shared-memory prefix sum over up to 8,192 span counts, then a binary search per key. Short or overflowed rows fall back to an exact listing over the scores.",
+    io: "staged keys, span counts -> keys in bucket order [B, 3p]",
+    launch: "One CTA per request",
+    hw: ["shared-memory prefix sum", "binary search"],
+    cost: ["FLOPs: none", "Bytes: a few thousand keys per request"],
+    bound: "Latency." },
+  { id: "ward", stage: "growth", cls: "WardClustering", short: "Ward clustering", hopper: true, steps: [{ step: "ward clustering", match: ["wardclustering", "ward"] }],
+    does: "Merges one cluster block's pools into 64 buckets with every round in shared memory. A Gram matrix by tf32x3 on WGMMA gives the Ward cost, mutual cheapest pairs merge (cheapest first when more than needed) with a bucket cap of 16 keys, then every pool is labelled.",
+    io: "pool keys [blocks, pools, 64] -> bucket labels, 64 bucket centroids per block",
+    launch: "Grid = blocks x ranks with thread-block clusters (up to 8 CTAs), 128 threads, up to 128 KB key sums in shared memory",
+    hw: ["WGMMA tf32x3", "cluster DSMEM", "st.shared::cluster", "cluster barriers", "cvt.rna.tf32", "sqrt.approx"],
+    cost: ["FLOPs per round: 3 x 2 P^2 d = 6.3 MFLOP at P = 128 pools", "Bytes: the block's pools once, 128 x 64 x 4 B"],
+    bound: "Latency. The rounds are serial.",
+    context: "Measured earlier: 41 us for 16 blocks of 128 pools against Triton's 60 us, and 630 against 1,554 us at 512 pools." },
+  { id: "pairing", stage: "growth", cls: "NodeBucketClustering", short: "Node-bucket clustering", hopper: true, steps: [{ step: "node-bucket clustering", match: ["nodebucketclustering", "pairing"] }],
+    does: "Persistent, with all rounds in one launch. Each open bucket finds its cheapest open partner (tf32x3 cost on WGMMA) and mutual pairs pair. Once 64 or fewer of a block remain open, the leader CTA builds a 64x64 cost matrix in shared memory and finishes alone. Every 8 rounds the leaders check whether to stop (nothing open, under 1/64 paired since the last check, or the round limit). Leftovers pair in index order.",
+    io: "bucket centroids [4,096, 64] -> pairs",
+    launch: "Persistent grid, all CTAs resident, about 82 KB shared memory",
+    hw: ["WGMMA tf32x3", "global spin barriers", "acquire loads + fence_acq_rel", "quad shuffles", "ballot / popc"],
+    cost: ["FLOPs per round: 3 x 2 n^2 d = 6.4 GFLOP at n = 4,096", "Bytes: the centroids once, 4,096 x 64 x 4 B"],
+    bound: "Synchronization and latency.",
+    context: "Triton took 2.3 ms per node-bucket clustering of 4,096." }
+];
+// The profiled GPU, and the steps whose CuTeDSL kernel it runs
+// A GPU's short name, as `B300` for `NVIDIA B300 SXM6 AC`
+function gpuLabel(m) {
+  if (m.label) return m.label;
+  var words = String(m.name || "").split(/\s+/).filter(function (w) { return w && w !== "NVIDIA"; });
+  return words.length ? words[0] : "";
+}
+var GPU = gpuLabel(RAW.machine || {});
+var CUTEDSL_STEPS = (RAW.machine || {}).cutedsl_steps || null;
+// A card's Blackwell kernel replaces its Hopper one on a Blackwell profile
+CARDS = CARDS.map(function (c) {
+  if (!(c.blackwell && (RAW.machine || {}).capability && RAW.machine.capability[0] === 10)) return c;
+  var out = Object.assign({}, c, c.blackwell);
+  out.onBlackwell = true;
+  return out;
+});
+// Where a card's CuTeDSL kernel runs, as a letter and a phrase - null for any GPU the table names
+function cardBadge(c) {
+  if (CUTEDSL_STEPS && c.steps.every(function (s) { return CUTEDSL_STEPS.indexOf(s.step) < 0; })) return { letter: "T", text: "Triton on this GPU" };
+  if (c.onBlackwell) return { letter: "B", text: "Blackwell only" };
+  if (c.hopper) return { letter: "H", text: "Hopper only" };
+  return null;
+}
+var CARD_BY_ID = {};
+CARDS.forEach(function (c) { CARD_BY_ID[c.id] = c; });
+
+/* ---------- helpers ---------- */
+var NS = "http://www.w3.org/2000/svg";
+function $(sel, root) { return (root || document).querySelector(sel); }
+function el(tag, attrs, kids) {
+  var e = document.createElement(tag);
+  setAttrs(e, attrs);
+  (kids || []).forEach(function (k) { e.appendChild(typeof k === "string" ? document.createTextNode(k) : k); });
+  return e;
+}
+function S(tag, attrs, parent) {
+  var e = document.createElementNS(NS, tag);
+  setAttrs(e, attrs);
+  if (parent) parent.appendChild(e);
+  return e;
+}
+function setAttrs(e, attrs) {
+  Object.keys(attrs || {}).forEach(function (k) {
+    if (attrs[k] === null || attrs[k] === undefined) return;
+    if (k === "text") e.textContent = attrs[k];
+    else e.setAttribute(k, attrs[k]);
+  });
+}
+function clear(e) { while (e.firstChild) e.removeChild(e.firstChild); }
+function num(v) { return typeof v === "number" && isFinite(v) ? v : null; }
+function pick() {
+  for (var i = 0; i < arguments.length; i++) { var n = num(arguments[i]); if (n !== null) return n; }
+  return null;
+}
+function ctxLabel(t) {
+  if (t === null || t === undefined) return "n/a";
+  if (t >= 1048576 && t % 1048576 === 0) return (t / 1048576) + "M";
+  if (t >= 1024 && t % 1024 === 0) return (t / 1024) + "k";
+  return String(t);
+}
+function fix(v, d) { return v === null || v === undefined ? "n/a" : v.toFixed(d); }
+function sig(v) {
+  if (v === null || v === undefined) return "n/a";
+  var a = Math.abs(v);
+  if (a === 0) return "0";
+  if (a >= 100) return v.toFixed(0);
+  if (a >= 10) return v.toFixed(1);
+  if (a >= 1) return v.toFixed(2);
+  if (a >= 0.01) return v.toFixed(3);
+  return v.toExponential(1);
+}
+function fmtFlops(v) {
+  if (v === null) return "n/a";
+  if (v >= 1e12) return sig(v / 1e12) + " TFLOP/s";
+  if (v >= 1e9) return sig(v / 1e9) + " GFLOP/s";
+  return sig(v / 1e6) + " MFLOP/s";
+}
+function fmtTflops(v) { return v === null ? "n/a" : sig(v / 1e12); }
+function fmtUs(ns) {
+  if (ns === null) return "n/a";
+  var us = ns / 1e3;
+  return us >= 1000 ? sig(us / 1e3) + " ms" : sig(us) + " us";
+}
+function pct(v) { return v === null ? "n/a" : v.toFixed(1) + "%"; }
+function cssVar(i) { return "var(--s" + i + ")"; }
+
+function shapePath(shape, r) {
+  var h = r * 0.9;
+  switch (shape) {
+    case "circle": return "M" + (-r) + ",0a" + r + "," + r + " 0 1,0 " + (2 * r) + ",0a" + r + "," + r + " 0 1,0 " + (-2 * r) + ",0Z";
+    case "square": return "M" + (-h) + "," + (-h) + "h" + (2 * h) + "v" + (2 * h) + "h" + (-2 * h) + "Z";
+    case "diamond": return "M0," + (-r * 1.2) + "L" + (r * 1.2) + ",0L0," + (r * 1.2) + "L" + (-r * 1.2) + ",0Z";
+    case "triangle": return "M0," + (-r * 1.2) + "L" + (r * 1.1) + "," + (r * 0.9) + "L" + (-r * 1.1) + "," + (r * 0.9) + "Z";
+    case "triangleDown": return "M0," + (r * 1.2) + "L" + (r * 1.1) + "," + (-r * 0.9) + "L" + (-r * 1.1) + "," + (-r * 0.9) + "Z";
+    default: // cross
+      var a = r * 1.1, b = r * 0.38;
+      return "M" + (-b) + "," + (-a) + "h" + (2 * b) + "v" + (a - b) + "h" + (a - b) + "v" + (2 * b) + "h" + (-(a - b)) + "v" + (a - b) + "h" + (-2 * b) + "v" + (-(a - b)) + "h" + (-(a - b)) + "v" + (-2 * b) + "h" + (a - b) + "Z";
+  }
+}
+var SERIES_SHAPES = ["circle", "square", "diamond", "triangle", "triangleDown", "cross"];
+function glyph(stageIdx, size) {
+  var svg = S("svg", { viewBox: "-8 -8 16 16", width: size || 12, height: size || 12, "aria-hidden": "true" });
+  S("path", { d: shapePath(STAGES[stageIdx].shape, 5.5), style: "fill:" + cssVar(stageIdx) + ";stroke:var(--bg);stroke-width:1" }, svg);
+  return svg;
+}
+
+/* ---------- normalise ---------- */
+var machine = RAW.machine || {};
+var spec = machine.spec || machine.specification || {};
+var peaks = machine.peaks || machine.reported || {};
+var anchors = machine.anchors || {};
+var M = {
+  bf16: pick(spec.bf16_tensor_tflops !== undefined ? spec.bf16_tensor_tflops * 1e12 : null, spec.tensor_bf16_flops),
+  tf32: pick(spec.tf32_tensor_tflops !== undefined ? spec.tf32_tensor_tflops * 1e12 : null, spec.tensor_tf32_flops),
+  fp8: pick(spec.fp8_tensor_tflops !== undefined ? spec.fp8_tensor_tflops * 1e12 : null, spec.tensor_fp8_flops),
+  fp32: pick(spec.fp32_tflops !== undefined ? spec.fp32_tflops * 1e12 : null, spec.fp32_flops),
+  hbm: pick(spec.hbm_tbps !== undefined ? spec.hbm_tbps * 1e12 : null, spec.hbm_bytes_per_second),
+  copy: pick(anchors.copy_gbps !== undefined ? anchors.copy_gbps * 1e9 : null, anchors.copy_bytes_per_second),
+  gemm: pick(anchors.bf16_gemm_tflops !== undefined ? anchors.bf16_gemm_tflops * 1e12 : null, anchors.bf16_gemm_flops),
+  l2: pick(peaks.l2_tbps !== undefined && peaks.l2_tbps !== null ? peaks.l2_tbps * 1e12 : null, peaks.l2_gbps !== undefined && peaks.l2_gbps !== null ? peaks.l2_gbps * 1e9 : null, peaks.l2_bytes_per_second),
+  ncuDram: pick(peaks.dram_bytes_per_second, peaks.dram_gbps !== undefined && peaks.dram_gbps !== null ? peaks.dram_gbps * 1e9 : null),
+  ncuFp32: pick(peaks.fp32_flops, peaks.fp32_tflops !== undefined && peaks.fp32_tflops !== null ? peaks.fp32_tflops * 1e12 : null)
+};
+
+function normKernel(r, index) {
+  var sol = r.sol || {}, fl = (r.flops && typeof r.flops === "object") ? r.flops : {}, by = r.bytes || {}, ln = r.launch || {}, dv = r.derived || {}, ins = r.instructions || {};
+  var step = r.step || "";
+  var k = { index: index, step: step, stage: r.stage || STAGE_OF[step] || "prefill scan", context: num(r.context), name: String(r.kernel || r.name || "") };
+  k.kernels = r.kernels === "triton" ? "triton" : "cutedsl";
+  k.cutedsl = typeof r.cutedsl === "boolean" ? r.cutedsl : (r.kind ? r.kind === "cutedsl" : (k.kernels === "cutedsl" && /cutlass|cute/i.test(k.name)));
+  k.triton = r.kind === "triton";
+  k.ns = pick(r.duration_ns, r.duration_us !== undefined && r.duration_us !== null ? r.duration_us * 1e3 : null);
+  var total = pick(fl.total, typeof r.flops === "number" ? r.flops : null);
+  var bf16 = pick(fl.tensor_bf16), tf32 = pick(fl.tensor_tf32), fp8 = pick(fl.tensor_fp8), fp32 = pick(fl.fp32, r.fp32_flops);
+  if (bf16 === null && tf32 === null && fp8 === null && num(r.tensor_flops) !== null) bf16 = r.tensor_flops;
+  k.flops = total;
+  k.pipes = { bf16: bf16 || 0, tf32: tf32 || 0, fp8: fp8 || 0, fp32: fp32 || 0 };
+  k.dramBytes = pick(by.dram_read !== undefined && by.dram_write !== undefined && by.dram_read !== null && by.dram_write !== null ? by.dram_read + by.dram_write : null, r.dram_bytes);
+  k.l2Bytes = pick(by.l2, r.l2_bytes);
+  var secs = k.ns ? k.ns * 1e-9 : null;
+  k.fps = pick(dv.flops_per_s, r.flops_per_second, secs && k.flops !== null ? k.flops / secs : null);
+  k.iD = pick(dv.dram_intensity, r.dram_intensity, k.flops !== null && k.dramBytes ? k.flops / k.dramBytes : null);
+  k.iL = pick(dv.l2_intensity, r.l2_intensity, k.flops !== null && k.l2Bytes ? k.flops / k.l2Bytes : null);
+  k.gbps = pick(dv.dram_gbps, r.dram_bytes_per_second !== undefined && r.dram_bytes_per_second !== null ? r.dram_bytes_per_second / 1e9 : null, secs && k.dramBytes !== null ? k.dramBytes / secs / 1e9 : null);
+  k.sm = pick(sol.sm, r.sm_pct);
+  k.mem = pick(sol.memory, r.compute_memory_pct);
+  k.dramPct = pick(sol.dram, r.dram_pct);
+  k.l2Pct = pick(sol.l2, r.l2_pct);
+  k.l1Pct = pick(sol.l1, r.l1_pct);
+  k.grid = ln.grid !== undefined ? ln.grid : (r.grid_size !== undefined ? r.grid_size : null);
+  k.block = ln.block !== undefined ? ln.block : (r.block_size !== undefined ? r.block_size : null);
+  k.regs = pick(ln.registers, r.registers_per_thread);
+  k.smem = (function () { var d = pick(ln.shared_dynamic, r.dynamic_shared_bytes), s = pick(ln.shared_static, r.static_shared_bytes); return d === null && s === null ? null : (d || 0) + (s || 0); })();
+  k.occ = pick(ln.occupancy, r.achieved_occupancy_pct);
+  k.label = stepName(k.step);
+  k.card = null;
+  return k;
+}
+// Both languages, by their index in the JSON
+var ALLK = (RAW.kernels || []).map(normKernel);
+// Everything below that draws one language reads the CuTeDSL kernels
+var KERNELS = ALLK.filter(function (k) { return k.kernels === "cutedsl"; });
+var ALLSTEPS = (RAW.steps || []).map(function (s) {
+  return { step: s.step || "", stage: s.stage || STAGE_OF[s.step] || "prefill scan", context: num(s.context), ms: pick(s.median_ms), min: pick(s.min_ms), follows: s.follows_context, kernels: s.kernels === "triton" ? "triton" : "cutedsl" };
+});
+var STEPS = ALLSTEPS.filter(function (s) { return s.kernels === "cutedsl"; });
+var HAS_TRITON = ALLK.some(function (k) { return k.kernels === "triton"; });
+
+/* group launches of a step and context, and bind each launch to its card */
+var GROUPS = {};
+KERNELS.forEach(function (k) {
+  var key = k.step + "@" + k.context;
+  (GROUPS[key] = GROUPS[key] || []).push(k);
+});
+function matchedFor(card, spec1, key) {
+  var group = GROUPS[spec1.step + "@" + key] || [];
+  var hit = group.filter(function (k, i) {
+    if (spec1.first) return i === 0;
+    var n = k.name.toLowerCase();
+    return spec1.match.some(function (m) { return n.indexOf(m) >= 0; });
+  });
+  return { hit: hit, group: group };
+}
+(function bind() {
+  Object.keys(GROUPS).forEach(function (key) {
+    var ctx = key.split("@")[1];
+    var group = GROUPS[key];
+    group.forEach(function (k, i) {
+      var found = null;
+      CARDS.forEach(function (c) {
+        if (found) return;
+        c.steps.forEach(function (s) {
+          if (found || s.step !== k.step) return;
+          if (s.first ? i === 0 : s.match.slice(0, 1).concat(s.match.slice(1)).some(function (m) { return k.name.toLowerCase().indexOf(m) >= 0; })) found = c;
+        });
+      });
+      if (found) { k.card = found.id; k.label = found.short; }
+    });
+  });
+})();
+function cardRecords(card, ctx) {
+  var out = [];
+  card.steps.forEach(function (s) {
+    var m = matchedFor(card, s, ctx);
+    var picked = m.hit.length ? m.hit : (m.group.length && !s.first ? m.group : []);
+    picked.forEach(function (k) { if (out.indexOf(k) < 0) out.push(k); });
+  });
+  return out;
+}
+
+var CONTEXTS = Array.from(new Set(KERNELS.map(function (k) { return k.context; }).concat(STEPS.map(function (s) { return s.context; })).filter(function (c) { return c !== null; }))).sort(function (a, b) { return a - b; });
+var CUTE = KERNELS.filter(function (k) { return k.cutedsl; });
+var cuteNames = new Set(CUTE.map(function (k) { return k.card || k.name; }));
+var nKernels = CUTE.length ? cuteNames.size : CARDS.length;
+
+/* ---------- run note ---------- */
+(function runNote() {
+  var note = $("#run-note");
+  note.textContent = (machine.commit ? "Measured on main at " + machine.commit : "Measured on one checkout of main") + ", both languages, with the timing pass run without a profiler attached.";
+})();
+
+/* ---------- header facts ---------- */
+(function facts() {
+  var items = [[nKernels, "CuTeDSL kernels"], [new Set(STEPS.map(function (s) { return s.step; })).size || "n/a", "steps"], [CONTEXTS.length ? CONTEXTS.map(ctxLabel).join(" ") : "n/a", "contexts"]];
+  var clk = KERNELS.map(function (k) { return pick((RAW.kernels[k.index] || {}).clock_hz); }).filter(function (v) { return v !== null; });
+  if (clk.length) items.push([sig(clk.reduce(function (a, b) { return a + b; }, 0) / clk.length / 1e9) + " GHz", "mean SM clock"]);
+  if (machine.name) items.push([machine.name, "device"]);
+  if (num(machine.sms) !== null) items.push([machine.sms, "SMs"]);
+  if (machine.ncu_version) items.push([machine.ncu_version, "Nsight Compute"]);
+  var ul = $("#facts");
+  items.forEach(function (it) { ul.appendChild(el("li", {}, [el("b", {}, [String(it[0])]), el("span", {}, [it[1]])])); });
+})();
+
+/* ---------- the profiled GPU ---------- */
+(function gpuText() {
+  var label = GPU || machine.name || "GPU";
+  $("#lede-gpu").textContent = label;
+  Array.prototype.forEach.call(document.querySelectorAll("[data-gpu]"), function (e) {
+    if (e.getAttribute("data-gpu") !== label) e.style.display = "none";
+  });
+  if (M.bf16 === null && M.hbm === null) return;
+  var parts = [];
+  if (M.bf16 !== null) parts.push(sig(M.bf16 / 1e12) + " TFLOP/s bf16 tensor");
+  if (M.tf32 !== null) parts.push(sig(M.tf32 / 1e12) + " TFLOP/s tf32 tensor");
+  if (M.fp8 !== null) parts.push(sig(M.fp8 / 1e12) + " TFLOP/s fp8 tensor");
+  if (M.fp32 !== null) parts.push(sig(M.fp32 / 1e12) + " TFLOP/s FP32");
+  if (M.hbm !== null) parts.push(sig(M.hbm / 1e12) + " TB/s HBM");
+  var text = label + " specification, dense: " + parts.join(", ") + ".";
+  if (machine.specification_source) text += " Source: " + machine.specification_source + ".";
+  var measured = [];
+  if (M.copy !== null) measured.push("a copy at " + sig(M.copy / 1e12) + " TB/s");
+  if (M.gemm !== null) measured.push("a cuBLAS bf16 GEMM at " + sig(M.gemm / 1e12) + " TFLOP/s");
+  if (measured.length) text += " Dashed lines are what " + measured.join(" and ") + " measured on this machine" + (machine.anchors_source ? " (" + machine.anchors_source + ")" : "") + ".";
+  $("#roofs-text").textContent = text;
+})();
+
+/* ---------- legends ---------- */
+function legend(host, ids) {
+  clear(host);
+  (ids || STAGES.map(function (s) { return s.id; })).forEach(function (id) {
+    var i = STAGE_INDEX[id];
+    host.appendChild(el("span", {}, [glyph(i, 14), STAGES[i].label]));
+  });
+}
+legend($("#stage-legend"));
+legend($("#sol-legend"));
+function hollowKey() {
+  var svg = S("svg", { viewBox: "-8 -8 16 16", width: 14, height: 14, "aria-hidden": "true" });
+  S("path", { d: shapePath("circle", 5), style: "fill:var(--panel);stroke:var(--ink);stroke-width:1.6" }, svg);
+  return el("span", {}, [svg, "hollow = Triton"]);
+}
+function filledKey() {
+  var svg = S("svg", { viewBox: "-8 -8 16 16", width: 14, height: 14, "aria-hidden": "true" });
+  S("path", { d: shapePath("circle", 5), style: "fill:var(--ink);stroke:var(--bg);stroke-width:1" }, svg);
+  return el("span", {}, [svg, "filled = CuTeDSL"]);
+}
+if (HAS_TRITON) {
+  $("#stage-legend").appendChild(hollowKey());
+  $("#sol-legend").appendChild(hollowKey());
+}
+
+/* ---------- time lookups ---------- */
+var NODE_NAMES = { samplepass: "Threshold estimate", threshold: "Threshold", listing: "Bucket scan", listed: "Candidate scoring", dense: "Dense scoring (fallback)", shortlisting: "Short-context listing", fill: "Expansion (by threshold)", inorder: "Expansion (in rank order)", beam: "Beam step", widekeep: "Start-level keep", pick: "Top-p pick", dsample: "Decode sample", dthreshold: "Decode threshold", dscan: "Decode scan", dorder: "Decode order", ward: "Ward clustering", pairing: "Node-bucket clustering" };
+var TSPEC = {
+  samplepass: ["threshold estimate", /samplepass/], threshold: ["threshold estimate", /thresholdsthreshold/],
+  listing: ["bucket scan"], listed: ["candidate scoring"], dense: ["dense scoring"], shortlisting: ["short-context listing"],
+  fill: ["expansion by threshold"], inorder: ["expansion in rank order"], widekeep: ["start-level keep"], beam: ["beam step"], pick: ["top-p pick"],
+  dsample: ["decode select", /decodesample/], dthreshold: ["decode select", /decodethreshold/], dscan: ["decode select", /decodescan/], dorder: ["decode select", /decodeorder/],
+  ward: ["ward clustering"], pairing: ["node-bucket clustering"]
+};
+var MAXCTX = CONTEXTS.length ? CONTEXTS[CONTEXTS.length - 1] : null;
+function timeAt(id, ctx) {
+  var s = TSPEC[id];
+  if (!s) return null;
+  var recs = (GROUPS[s[0] + "@" + ctx] || []).filter(function (k) { return k.cutedsl && k.ns !== null && (!s[1] || s[1].test(k.name.toLowerCase())); });
+  if (!recs.length) return null;
+  var a = aggregate(recs);
+  return { ns: a.ns, ctx: ctx, sm: a.sm, dramPct: a.dramPct, gbps: a.gbps, recs: recs };
+}
+function timeOf(id) {
+  for (var i = CONTEXTS.length - 1; i >= 0; i--) { var t = timeAt(id, CONTEXTS[i]); if (t) return t; }
+  return null;
+}
+Array.prototype.forEach.call(document.querySelectorAll(".maxctx"), function (e) { e.textContent = MAXCTX === null ? "the largest context" : ctxLabel(MAXCTX); });
+$("#ov-ctx").textContent = MAXCTX === null ? "the largest context" : ctxLabel(MAXCTX);
+
+/* ---------- chips and flowchart primitives ---------- */
+function kchip(id) {
+  var si = STAGE_INDEX[CARD_BY_ID[id].stage];
+  var a = el("a", { "class": "kchip", href: "#k-" + id }, [glyph(si, 12), NODE_NAMES[id]]);
+  a.style.borderColor = cssVar(si);
+  return a;
+}
+Array.prototype.forEach.call(document.querySelectorAll("[data-chips]"), function (host) {
+  host.getAttribute("data-chips").split(",").forEach(function (id) { host.appendChild(kchip(id)); });
+});
+
+var BW = 196, BH = 48, TH = 44, PH = 36;
+function flowSvg(svg, W, H) {
+  clear(svg);
+  svg.setAttribute("viewBox", "0 0 " + W + " " + H);
+  var mid = "ah-" + svg.id;
+  var mk = S("marker", { id: mid, viewBox: "0 0 8 8", refX: 7, refY: 4, markerWidth: 7, markerHeight: 7, orient: "auto" }, S("defs", {}, svg));
+  S("path", { d: "M0,0L8,4L0,8Z", "class": "arrowhead" }, mk);
+  return mid;
+}
+function txt(svg, x, y, text, cls, anchor) { return S("text", { x: x, y: y, "class": cls, "text-anchor": anchor || "start", text: text }, svg); }
+function edge(svg, mid, pts, dash) {
+  S("path", { d: "M" + pts.map(function (p) { return p[0] + "," + p[1]; }).join("L"), "class": "arrow", "marker-end": "url(#" + mid + ")", "stroke-dasharray": dash ? "6 4" : null }, svg);
+}
+// A block of data labels centred between y1 and y2
+function dataLab(svg, x, y1, y2, lines, anchor) {
+  var top = (y1 + y2) / 2 - lines.length * 7;
+  lines.forEach(function (t, i) { txt(svg, x, top + 11 + i * 14, t, "edgelab", anchor); });
+}
+function container(svg, x, y, w, h, label) {
+  S("rect", { x: x, y: y, width: w, height: h, rx: 6, "class": "container" }, svg);
+  txt(svg, x + 12, y + 18, label, "contlab");
+}
+function bounds(cx, cy, w, h) { return { cx: cx, cy: cy, l: cx - w / 2, r: cx + w / 2, t: cy - h / 2, b: cy + h / 2 }; }
+function kn(svg, id, cx, cy, o) {
+  o = o || {};
+  var card = CARD_BY_ID[id], si = STAGE_INDEX[card.stage], bx = bounds(cx, cy, BW, BH);
+  var a = S("a", { href: "#k-" + id, "aria-label": NODE_NAMES[id] + ", " + card.stage + ". Go to its card" }, svg);
+  S("rect", { x: bx.l, y: bx.t, width: BW, height: BH, "class": "nodebox", style: "stroke:" + cssVar(si) }, a);
+  S("path", { d: shapePath(STAGES[si].shape, 4.5), transform: "translate(" + (bx.l + 14) + "," + (bx.t + 16) + ")", style: "fill:" + cssVar(si) }, a);
+  txt(a, bx.l + 26, bx.t + 20, NODE_NAMES[id], "nodetxt");
+  var tm = o.unprofiled ? null : timeOf(id);
+  var sub = o.unprofiled ? "not profiled at decode" : tm ? fmtUs(tm.ns) + (tm.ctx !== MAXCTX ? " @ " + ctxLabel(tm.ctx) : "") : "not in this profile";
+  txt(a, bx.l + 10, bx.t + 40, sub, tm ? "nodetime" : "nodesub");
+  var badge = cardBadge(card);
+  if (badge) txt(a, bx.r - 8, bx.t + 20, badge.letter, "nodesub", "end");
+  attachTip(a, function () {
+    var lines = [NODE_NAMES[id], card.stage + (badge ? ", " + badge.text : "")];
+    if (tm) lines.push(["time", fmtUs(tm.ns)], ["context", ctxLabel(tm.ctx)], ["SM throughput", pct(tm.sm)], ["DRAM throughput", pct(tm.dramPct)]);
+    else lines.push(o.unprofiled ? "Not profiled at decode." : "No measurement in this profile.");
+    return lines;
+  });
+  return bx;
+}
+function tn(svg, name, sub, cx, cy) {
+  var bx = bounds(cx, cy, BW, TH);
+  S("rect", { x: bx.l, y: bx.t, width: BW, height: TH, "class": "nodebox", style: "stroke:var(--torch);stroke-dasharray:4 3;stroke-width:1.5" }, svg);
+  txt(svg, bx.l + 10, bx.t + 18, name, "nodetxt", "start").setAttribute("style", "fill:var(--torch)");
+  txt(svg, bx.l + 10, bx.t + 35, sub, "nodesub");
+  return bx;
+}
+function dn(svg, lines, cx, cy, hw, hh) {
+  var bx = bounds(cx, cy, 2 * hw, 2 * hh);
+  S("path", { d: "M" + cx + "," + bx.t + "L" + bx.r + "," + cy + "L" + cx + "," + bx.b + "L" + bx.l + "," + cy + "Z", "class": "nodebox", style: "stroke:var(--ink2);stroke-width:1.5" }, svg);
+  lines.forEach(function (t, i) { txt(svg, cx, cy + 4 + (i - (lines.length - 1) / 2) * 15, t, "nodetxt", "middle"); });
+  return bx;
+}
+function pill(svg, text, cx, cy, w) {
+  var bx = bounds(cx, cy, w, PH);
+  S("rect", { x: bx.l, y: bx.t, width: w, height: PH, rx: 18, "class": "nodebox", style: "stroke:var(--ink);stroke-width:1.5" }, svg);
+  txt(svg, cx, cy + 4, text, "nodetxt", "middle");
+  return bx;
+}
+// Straight vertical arrow with a data label to its right
+function down(svg, mid, a, b, lines, dash, x) {
+  x = x === undefined ? a.cx : x;
+  edge(svg, mid, [[x, a.b], [x, b.t]], dash);
+  if (lines) dataLab(svg, x + 9, a.b, b.t, lines);
+}
+function loopRight(svg, mid, bx, label) {
+  S("path", { d: "M" + bx.r + "," + (bx.cy - 8) + "H" + (bx.r + 30) + "V" + (bx.cy + 14) + "H" + (bx.r + 2), "class": "arrow", "stroke-dasharray": "6 4", "marker-end": "url(#" + mid + ")" }, svg);
+  txt(svg, bx.r + 38, bx.cy + 10, label, "condlab");
+}
+
+/* ---------- the funnel ---------- */
+var FUNNEL = { design: "flat", phase: "prefill", read: "descend", ctx: 10485760 };
+var FUNNEL_CONTEXTS = [131072, 262144, 1048576, 2097152, 10485760];
+var FUNNEL_STORE = "roofline-funnel";
+// Served shapes: the beam, the node buckets and the gates of the read
+var SERVED = { pool: 4, bucket: 8, node: 4, beam: 2048, topP: 1024, topK: 4096, window: 512, sink: 4, startNodes: 32768, growth: 4096, scanBuckets: 32768, beamSelectColumns: 196608, keepWords: 57800, listedFirstColumns: 28000 };
+var TORCH_MM_START = { plain: "torch.mm start level scores", kind: "torch" };
+var TORCH_MM_OWN = { plain: "torch.mm uncovered scores", kind: "torch" };
+var TORCH_MM_ALL = { plain: "torch.mm scores [R, N]", kind: "torch" };
+function commas(n) { return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ","); }
+
+// The node buckets each level holds at N buckets - fixed one level over blocks of 1,024, tree levels over blocks of 4,096
+function nodeLevels(design, N) {
+  var block = design === "fixed" ? 1024 : 4096, top = design === "fixed" ? 1 : 16, nodes = [];
+  if (design === "flat" || Math.floor(N / block) * block < SERVED.growth) return nodes;
+  nodes.push(Math.floor(N / block) * block / SERVED.node);
+  while (nodes.length < top && nodes[nodes.length - 1] >= 4096) {
+    nodes.push(Math.floor(nodes[nodes.length - 1] / 4096) * 4096 / SERVED.node);
+  }
+  return nodes;
+}
+// The lowest level of at most 32,768 node buckets for tree, the one level for fixed
+function startLevel(design, nodes) {
+  if (design === "fixed") return 1;
+  for (var l = 1; l <= nodes.length; l++) if (nodes[l - 1] <= SERVED.startNodes) return l;
+  return nodes.length;
+}
+function nearestContext(id, ctx) {
+  var have = CONTEXTS.filter(function (c) { return timeAt(id, c); });
+  if (!have.length) return null;
+  if (have.indexOf(ctx) >= 0) return ctx;
+  have.sort(function (a, b) { return Math.abs(Math.log(a / ctx)) - Math.abs(Math.log(b / ctx)); });
+  return have[0];
+}
+// A chip's time: its measured CuTeDSL replay at the context, else at the nearest one it ran at - none where the step is not profiled
+function chipTime(id, cfg, unprofiled) {
+  if (unprofiled) return null;
+  var c = nearestContext(id, cfg.ctx);
+  if (c === null) return null;
+  var t = timeAt(id, c);
+  return fmtUs(t.ns) + (c === cfg.ctx ? "" : " @" + ctxLabel(c));
+}
+
+function flatThresholdMeaning(T, N, decode) {
+  if (decode) return "A decode step has one query a request. Sampling scores a strided sample of the request's buckets, runs of 8 neighbours, and the threshold is a radix search over the sample for the score that about 1.5 x top-p = 1,536 buckets beat. The scan then scores every one of the request's " + commas(N) + " buckets once through its pages and stages those above the cutoff, and the order step joins the staged spans in bucket order, with room for 3 x top-p = 3,072. A row that comes up short or overflows is listed exactly from the scores.";
+  return "Sorting " + commas(N) + " scores per query is too slow, so the read first estimates a cutoff. The threshold estimate scores every 24th bucket and histogram the scores to find, per query, the score that about 1.5 x top-p = 1,536 buckets beat - half again as many as needed, so the true best 1,024 are almost surely among them. The bucket scan then scores every bucket once and keeps only those above the cutoff, with room for 3 x top-p = 3,072 a query. A query that keeps fewer than 1,024 or overflows 3,072 takes the slower path the flowchart marks \"did the row's bucket scan miss?\".";
+}
+var MEAN_BUCKETS = function (N) { return "Ward clustering first sums each 4 consecutive index keys into a pool key, so a closed 512-key cluster block becomes 128 pools. It then merges the pools into 64 buckets, never splitting a pool, so a bucket is whole pools - usually 2, about 8 keys (at most 16). The pools of a bucket are alike in content but need not be neighbours. N = T / 8 = " + commas(N) + " buckets exist. A bucket keeps one centroid, the sum of its keys' index vectors. A query scores the centroids, 8 times fewer than the keys, and a picked bucket is read whole, every key at full resolution - pooling groups keys for clustering and compresses nothing that attention reads."; };
+var MEAN_SELECTION = "The picked buckets' keys, cut at top-k = 4,096, plus the 512 keys of the query's own window and the 4 sink keys: 4,096 + 512 + 4 = 4,612 indices handed to sparse attention.";
+
+function flatPath(cfg, c) {
+  var decode = cfg.phase === "decode", grows = cfg.design !== "flat";
+  var cluster = { label: "cluster", lines: [{ ids: grows ? ["ward", "pairing"] : ["ward"], note: grows ? "node-bucket clustering builds the node buckets, at a page end" : null }] };
+  var keys = { name: "Keys", sub: "every key in the context", n: c.T, count: commas(c.T), mean: "The context has T keys, " + commas(c.T) + " at " + ctxLabel(c.T) + (decode ? ". A decode step has one query for each request, and it reads the whole context." : ". A prefill chunk has 32,768 queries, each reading the context before it.") + " Scoring every key for every query is what the indexer avoids." };
+  var buckets = { name: "Buckets", sub: "keys grouped about 8 to a bucket", n: c.N, count: commas(c.N), mean: MEAN_BUCKETS(c.N) };
+  var pick = { name: "Top-p buckets", sub: "the best buckets, exactly", n: 1024, count: "1,024", mean: "The expansion finds the exact best 1,024 buckets within the short list, by score." };
+  var sel = { name: "Selection", sub: "their keys, plus window and sink", n: 4612, count: "4,612 indices", mean: MEAN_SELECTION, after: "-> sparse attention over these keys, unchanged and not on this page" };
+  if (!decode && c.N < SERVED.scanBuckets) {
+    pick.sub = "listed from the full scores";
+    pick.n2 = 3072;
+    pick.count = "1,024, room for 3,072";
+    pick.mean = "Below 32,768 buckets the read scores every bucket with one torch.mm product, and the short-context listing lists the best 1,024 of each row directly, with room for 3 x top-p = 3,072. There is no threshold estimate, and the expansion turns the listing into keys.";
+    return { stages: [keys, buckets, pick, sel], conns: [cluster, { label: "score and list", lines: [{ ids: [TORCH_MM_ALL, "shortlisting"], note: "short: N < 32,768 buckets" }] }, { label: "expand", lines: [{ ids: ["fill"] }] }] };
+  }
+  var above = { name: "Buckets above the threshold", sub: "the short list each query keeps", n: 1536, n2: 3072, count: "about 1,536, held up to 3,072", mean: flatThresholdMeaning(c.T, c.N, decode) };
+  if (decode) {
+    return { stages: [keys, buckets, above, pick, sel], conns: [cluster,
+      { label: "sample", lines: [{ ids: ["dsample", "dthreshold"] }] },
+      { label: "scan", lines: [{ ids: ["dscan", "dorder"] }] },
+      { label: "expand", lines: [{ ids: ["fill"], note: "expansion is not profiled at decode", unprofiled: true }] }] };
+  }
+  return { stages: [keys, buckets, above, pick, sel], conns: [cluster,
+    { label: "threshold", lines: [{ ids: ["samplepass", "threshold"] }] },
+    { label: "list", lines: [{ ids: ["listing", "listed"] }] },
+    { label: "pick and expand", lines: [{ ids: ["fill", "dense", "inorder"], note: "dense scoring and rank-order expansion serve rows whose bucket scan missed" }] }] };
+}
+
+function beamPath(cfg, c) {
+  var decode = cfg.phase === "decode", design = cfg.design;
+  var nodes = nodeLevels(design, c.N), start = startLevel(design, nodes), width = nodes[start - 1];
+  var block = design === "fixed" ? 1024 : 4096;
+  // The start level's keep takes one of three routes by its width
+  var fused = width >= SERVED.beamSelectColumns, wide = width + 3072 > SERVED.keepWords, listedFirst = width > SERVED.listedFirstColumns;
+  var held = nodes.map(function (n, i) { return "level " + (i + 1) + ": " + commas(n); }).join(", ");
+  var keys = { name: "Keys", sub: "every key in the context", n: c.T, count: commas(c.T), mean: "The context has T keys, " + commas(c.T) + " at " + ctxLabel(c.T) + (decode ? ". A decode step has one query for each request, and the beam reads it eagerly, a request at a time." : ". A prefill chunk has 32,768 queries, each reading the context before it.") + " Scoring every key for every query is what the indexer avoids." };
+  var buckets = { name: "Buckets", sub: "keys grouped about 8 to a bucket", n: c.N, count: commas(c.N), mean: MEAN_BUCKETS(c.N) };
+  var level = {
+    name: "Level " + start + " node buckets", sub: design === "fixed" ? "the one level, scored whole" : "the start level, scored whole",
+    n: width, count: commas(width),
+    mean: "A node bucket averages 4 buckets of the level below, and its centroid is the normalized sum of every index key beneath it. " +
+      (design === "fixed" ? "Fixed pairs each block of 1,024 buckets into 256 node buckets, one level, so level 1 holds N / 4 = " + commas(width) + " of them and every query scores all of it. "
+        : "Tree pairs over blocks of 4,096 at every level, so level l holds about N / 4^l node buckets (" + held + "). The beam starts at the lowest level of at most 32,768, level " + start + " here, and scores all " + commas(width) + " of it whole, as though the level above had kept every node. ") +
+      "Node-bucket clustering runs at a page end, as a block's worth of buckets closes. The start level's keep takes one of three routes by its width: up to about 57,800 columns the CuTeDSL keep (a row wider than about 28,000 lists first, ordered, and then keeps, which is the profiled start-level keep step at 32,768, and a narrower row goes to the beam kernel directly); wider but under 196,608 columns a Triton top-k and kept children; from 196,608 columns the fused Triton beam_select. Here: route " + (fused ? "3" : wide ? "2" : "1") + "."
+  };
+  var stages = [keys, buckets, level];
+  var conns = [{ label: "cluster", lines: [{ ids: ["ward", "pairing"], note: "node-bucket clustering builds the node buckets, at a page end" }] }];
+  var keepConn;
+  if (fused) {
+    conns.push({ label: "score", text: "scored inside the fused keep below, no score matrix is written" });
+    keepConn = { label: "keep", lines: [{ ids: [{ plain: "Triton beam_select", kind: "triton" }], note: "route 3: a start row of at least 196,608 columns takes the fused select, Triton only" }] };
+  } else {
+    conns.push({ label: "score", lines: [{ ids: [TORCH_MM_START] }] });
+    if (wide) keepConn = { label: "keep", lines: [{ ids: [{ plain: "Triton top-k", kind: "triton" }, { plain: "Triton kept children", kind: "triton" }], note: "route 2: too wide for the CuTeDSL keep, under 196,608 columns" }] };
+    else if (listedFirst) keepConn = { label: "keep", lines: [{ ids: ["shortlisting", "widekeep"], noTime: ["shortlisting"], note: "route 1: the CuTeDSL keep, a row this wide lists first (ordered) and then keeps" }] };
+    else keepConn = { label: "keep", lines: [{ ids: ["beam"], unprofiled: true, note: "route 1: the CuTeDSL keep, a row this narrow goes to the beam kernel, no carried children; not profiled at this width" }] };
+  }
+  keepConn.lines[0].unprofiled = decode;
+  conns.push(keepConn);
+  var kept = function (l) {
+    return { name: "Kept at level " + l, sub: "the beam's best node buckets", n: 2048, count: "2,048 node buckets, 8,192 children",
+      mean: l === start ? "The beam keeps the best 2,048 node buckets of the start level - " + (fused ? "inside the same fused select, Triton only at this width - " : "") + "and the 4 children of each, 8,192 buckets or node buckets, go down a level."
+        : "Level " + l + " scores the 8,192 children the level above kept together with its own open node buckets, those not yet under a node bucket above, fewer than 4,096, and keeps the best 2,048. Their 8,192 children go down again." };
+  };
+  stages.push(kept(start));
+  for (var l = start - 1; l >= 1; l--) {
+    conns.push({ label: "beam step " + l, lines: [{ ids: ["beam"], note: decode ? "not profiled at decode, one query a request" : null, unprofiled: decode }] });
+    stages.push(kept(l));
+  }
+  stages.push({ name: "Top-p buckets", sub: "the best buckets, exactly", n: 1024, count: "1,024",
+    mean: "Level 0 scores the 8,192 children the last beam kept and the buckets no node bucket covers, fewer than 4,096 at the served growth, and picks the best 1,024 exactly, a tie going to the lower bucket. The torch.mm scores the uncovered buckets and the pick kernel scores the children and picks." });
+  conns.push({ label: "level 0 top-p pick", lines: [{ ids: [TORCH_MM_OWN, "pick"], unprofiled: decode }] });
+  stages.push({ name: "Selection", sub: "their keys, plus window and sink", n: 4612, count: "4,612 indices", mean: MEAN_SELECTION, after: "-> sparse attention over these keys, unchanged and not on this page" });
+  conns.push({ label: "expand", lines: [{ ids: ["fill"], note: decode ? "not profiled at decode" : null, unprofiled: decode }] });
+  return { stages: stages, conns: conns, nodes: nodes, start: start };
+}
+
+// Every configuration the controls reach, by design, phase and decode read
+var FUNNEL_PATHS = {
+  "flat-prefill": flatPath, "flat-decode": flatPath,
+  "fixed-prefill": beamPath, "fixed-decode-flat": flatPath, "fixed-decode-descend": beamPath,
+  "tree-prefill": beamPath, "tree-decode-flat": flatPath, "tree-decode-descend": beamPath
+};
+function funnelKey(cfg) {
+  return cfg.design + "-" + cfg.phase + (cfg.phase === "decode" && cfg.design !== "flat" ? "-" + cfg.read : "");
+}
+function funnelPlan(cfg) {
+  return FUNNEL_PATHS[funnelKey(cfg)](cfg, { T: cfg.ctx, N: cfg.ctx / SERVED.bucket });
+}
+
+function drawFunnel() {
+  var cfg = FUNNEL, plan = funnelPlan(cfg), svg = $("#funnel"), W = 1100, mid = flowSvg(svg, W, 100);
+  var X0 = 270, MAXW = 540, lo = 2.5, hi = Math.log10(10485760), RIGHT = W - 14;
+  function bw(n) { return MAXW * (Math.log10(n) - lo) / (hi - lo); }
+  function chipLabel(it, line) {
+    if (typeof it !== "string") return it.plain;
+    var t = chipTime(it, cfg, line.unprofiled || (line.noTime || []).indexOf(it) >= 0);
+    return NODE_NAMES[it] + (t ? "  " + t : "");
+  }
+  // Place a connector's chips, wrapping at the right edge, then its notes under them
+  function layout(cn) {
+    var rows = [], y = 0;
+    (cn.lines || []).forEach(function (ln) {
+      var x = X0 + 30, row = [];
+      ln.ids.forEach(function (it) {
+        var label = chipLabel(it, ln), w = 38 + label.length * 7.2;
+        if (x + w > RIGHT && row.length) { rows.push({ y: y, chips: row }); y += 30; row = []; x = X0 + 30; }
+        row.push({ it: it, label: label, x: x, w: w });
+        x += w + 8;
+      });
+      rows.push({ y: y, chips: row });
+      y += 30;
+      if (ln.note) { rows.push({ y: y, note: ln.note, x: X0 + 30 }); y += 18; }
+    });
+    if (cn.text) { rows.push({ y: y, note: cn.text, x: X0 + 30 }); y += 18; }
+    return { rows: rows, h: Math.max(y + 8, 38) };
+  }
+  function chip(c, y) {
+    var it = c.it;
+    if (typeof it !== "string") {
+      S("rect", { x: c.x, y: y, width: c.w, height: 24, "class": "chipbox", style: "stroke:var(" + (it.kind === "torch" ? "--torch" : "--ink2") + ");stroke-dasharray:4 3" }, svg);
+      txt(svg, c.x + 10, y + 16.5, c.label, "chiptxt");
+      return;
+    }
+    var si = STAGE_INDEX[CARD_BY_ID[it].stage];
+    var a = S("a", { href: "#k-" + it, "aria-label": NODE_NAMES[it] + ". Go to its card" }, svg);
+    S("rect", { x: c.x, y: y, width: c.w, height: 24, "class": "chipbox", style: "stroke:" + cssVar(si) }, a);
+    S("path", { d: shapePath(STAGES[si].shape, 4), transform: "translate(" + (c.x + 13) + "," + (y + 12) + ")", style: "fill:" + cssVar(si) }, a);
+    txt(a, c.x + 24, y + 16.5, c.label, "chiptxt");
+  }
+  var y = 8;
+  plan.stages.forEach(function (st, i) {
+    txt(svg, 8, y + 14, st.name, "stagename");
+    txt(svg, 8, y + 30, st.sub, "tag");
+    var w = bw(st.n);
+    S("rect", { x: X0, y: y + 4, width: w, height: 26, "class": "funbar" }, svg);
+    var end = X0 + w;
+    if (st.n2) { end = X0 + bw(st.n2); S("rect", { x: X0 + w, y: y + 4, width: end - X0 - w, height: 26, "class": "funext" }, svg); }
+    txt(svg, end + 10, y + 22, st.count, "cnt");
+    y += 36;
+    var cn = plan.conns[i];
+    if (!cn) { if (st.after) { txt(svg, X0 + 30, y + 12, st.after, "tag"); y += 24; } return; }
+    var lay = layout(cn);
+    edge(svg, mid, [[X0 + 12, y - 2], [X0 + 12, y + lay.h - 4]]);
+    txt(svg, 8, y + 18, cn.label, "condlab");
+    lay.rows.forEach(function (r) {
+      if (r.note) txt(svg, r.x, y + r.y + 12, r.note, "tag");
+      else r.chips.forEach(function (c) { chip(c, y + r.y + 3); });
+    });
+    y += lay.h;
+  });
+  svg.setAttribute("viewBox", "0 0 " + W + " " + (y + 4));
+  svg.setAttribute("aria-label", "Funnel from " + commas(cfg.ctx) + " keys to a selection of 4,612 indices for " + funnelKey(cfg).replace(/-/g, " ") + ", with the kernels of each step");
+  var host = $("#funnel-meaning");
+  clear(host);
+  plan.stages.forEach(function (st) {
+    host.appendChild(el("li", {}, [el("b", {}, [st.name + "."]), " " + st.mean]));
+  });
+  var decodeNote = cfg.phase === "decode" ? " At decode every request reads one query." : "";
+  $("#funnel-note").textContent = "Served shapes at " + ctxLabel(cfg.ctx) + ", design numbers, not measurements." + decodeNote + " Bar widths are log scaled and the counts are printed. A kernel chip shows its measured CuTeDSL time at " + ctxLabel(cfg.ctx) + ", or at the context marked @ where it only ran at another, and links to its card. A dashed chip is a torch or Triton op with no CuTeDSL kernel. A step with no time is not profiled in this phase.";
+}
+(function funnelControls() {
+  try {
+    var saved = JSON.parse(localStorage.getItem(FUNNEL_STORE) || "null");
+    if (saved && ["flat", "fixed", "tree"].indexOf(saved.design) >= 0 && ["prefill", "decode"].indexOf(saved.phase) >= 0 && ["flat", "descend"].indexOf(saved.read) >= 0 && FUNNEL_CONTEXTS.indexOf(saved.ctx) >= 0) FUNNEL = saved;
+  } catch (e) { /* storage may be blocked */ }
+  var sel = $("#funnel-context");
+  FUNNEL_CONTEXTS.forEach(function (c) { sel.appendChild(el("option", { value: String(c) }, [ctxLabel(c)])); });
+  function sync() {
+    ["design", "phase", "read"].forEach(function (name) {
+      Array.prototype.forEach.call(document.querySelectorAll("input[name=funnel-" + name + "]"), function (r) { r.checked = r.value === FUNNEL[name]; });
+    });
+    sel.value = String(FUNNEL.ctx);
+    $("#funnel-read").hidden = !(FUNNEL.phase === "decode" && FUNNEL.design !== "flat");
+  }
+  function save() { try { localStorage.setItem(FUNNEL_STORE, JSON.stringify(FUNNEL)); } catch (e) { /* storage may be blocked */ } }
+  ["design", "phase", "read"].forEach(function (name) {
+    Array.prototype.forEach.call(document.querySelectorAll("input[name=funnel-" + name + "]"), function (r) {
+      r.addEventListener("change", function () { if (r.checked) { FUNNEL[name] = r.value; sync(); save(); drawFunnel(); } });
+    });
+  });
+  sel.addEventListener("change", function () { FUNNEL.ctx = Number(sel.value); save(); drawFunnel(); });
+  sync();
+})();
+
+/* ---------- the flowcharts ---------- */
+function maintain(svg, mid, label) {
+  container(svg, 20, 76, 1060, 112, label);
+  var append = tn(svg, "append keys", "cache append", 200, 148);
+  var ward = kn(svg, "ward", 560, 148), pairing = kn(svg, "pairing", 940, 148);
+  edge(svg, mid, [[append.r, 148], [ward.l, 148]], true);
+  clab(svg, (append.r + ward.l) / 2, 140, "when a block closes");
+  dataLab(svg, (append.r + ward.l) / 2, 150, 176, ["pools [blocks,
