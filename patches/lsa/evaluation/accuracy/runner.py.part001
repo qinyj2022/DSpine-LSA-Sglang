@@ -1,0 +1,30 @@
+     for plan in self.plans:
+            if plan.concurrency is not None:
+                group_limits.setdefault(plan.cap_group, asyncio.Semaphore(self.task_concurrency(plan)))
+
+        async def run_and_write(plan: suites.Plan) -> None:
+            """Run one plan under its cap group's limit and the pool's, then write the record."""
+            group = [group_limits[plan.cap_group]] if plan.concurrency is not None else []
+            await self.run_plan(plan, [*group, shared])
+            self.write()
+
+        for phase in sorted({plan.phase for plan in self.plans}):
+            plans = [plan for plan in self.plans if plan.phase == phase]
+            self.log(
+                f"phase {phase + 1} of {len(Suite.PHASES)}: {len(plans)} tasks, {', '.join(Suite.PHASES[phase])}"
+            )
+            await asyncio.gather(*(run_and_write(plan) for plan in plans))
+
+    def run(self) -> dict[str, Any]:
+        """Run every plan and return the record it wrote."""
+        os.makedirs(self.out, exist_ok=True)
+        io.write_json(os.path.join(self.out, Records.SERVER_INFO), self.info, indent=1)
+        self.log(f"{self.run_id}: {len(self.plans)} tasks -> {self.out}, {self.in_flight} requests in flight")
+        self.write()
+        asyncio.run(self.run_plans())
+        self.log(
+            f"done in {round(time.perf_counter() - self.start, 1)} s: {os.path.join(self.out, Records.RECORD)}"
+        )
+        if self.skipped:
+            self.log(f"skipped {len(self.skipped)} tasks without data: {' '.join(self.skipped)}")
+        return self.header()
