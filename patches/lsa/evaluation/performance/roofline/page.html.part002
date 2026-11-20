@@ -1,0 +1,687 @@
+ 128, 64]"], "middle");
+  edge(svg, mid, [[ward.r, 148], [pairing.l, 148]], true);
+  clab(svg, (ward.r + pairing.l) / 2, 140, "at a page end, fixed or tree");
+  dataLab(svg, (ward.r + pairing.l) / 2, 150, 176, ["centroids [4,096, 64]"], "middle");
+}
+function clab(svg, x, y, t) { return txt(svg, x, y, t, "condlab", "middle"); }
+
+function drawPrefill() {
+  var svg = $("#flow-prefill"), mid = flowSvg(svg, 1100, 1230);
+  var c1 = 100, c2 = 360, c3 = 600, c4 = 960;
+  var start = pill(svg, "a chunk: 32,768 index queries and their keys", 560, 30, 470);
+  edge(svg, mid, [[560, start.b], [560, 76]]);
+  txt(svg, 570, 68, "new keys, index queries [R, 64] bf16", "edgelab");
+  maintain(svg, mid, "Maintain the index");
+  var design = dn(svg, ["design?"], 560, 290, 96, 36);
+  edge(svg, mid, [[560, 188], [560, design.t]]);
+  dataLab(svg, 570, 188, design.t, ["bucket centroids [N, 64] bf16"]);
+
+  // Flat
+  edge(svg, mid, [[design.l, 290], [c2, 290], [c2, 364]], true);
+  clab(svg, 412, 282, "flat");
+  var big = dn(svg, ["N >= 32,768", "visible buckets?"], c2, 400, 124, 36);
+  edge(svg, mid, [[big.l, 400], [c1, 400], [c1, 476]], true);
+  clab(svg, 168, 392, "yes: scan");
+  edge(svg, mid, [[big.r, 400], [c3, 400], [c3, 478]], true);
+  clab(svg, 542, 392, "no: short");
+
+  var sp = kn(svg, "samplepass", c1, 500), th = kn(svg, "threshold", c1, 590), li = kn(svg, "listing", c1, 680), ls = kn(svg, "listed", c1, 770);
+  down(svg, mid, sp, th, ["histograms", "[R, 64] int32"]);
+  down(svg, mid, th, li, ["thresholds", "[R] fp32"]);
+  down(svg, mid, li, ls, ["listed buckets", "[R, 3p] int32"]);
+  var miss = dn(svg, ["did the row's", "bucket scan miss?"], c1, 880, 92, 36);
+  down(svg, mid, ls, miss, ["keys", "[R, 3p] int64"]);
+  var f1 = kn(svg, "fill", c1, 978);
+  down(svg, mid, miss, f1, null, true);
+  clab(svg, c1 + 18, 940, "no").setAttribute("text-anchor", "start");
+  var dense = kn(svg, "dense", c2, 942);
+  edge(svg, mid, [[miss.r, 880], [c2, 880], [c2, dense.t]], true);
+  clab(svg, 276, 872, "yes");
+  var topk = tn(svg, "torch top-k", "per 256 rows", c2, 1030);
+  down(svg, mid, dense, topk, ["scores", "[256, N] fp32"]);
+  var inord = kn(svg, "inorder", c2, 1112);
+  down(svg, mid, topk, inord, ["picks", "[R, p] int32"]);
+
+  // Short
+  var mm = tn(svg, "torch.mm", "scores [R, N]", c3, 500);
+  var sl = kn(svg, "shortlisting", c3, 590);
+  down(svg, mid, mm, sl, ["scores", "[R, N] fp32"]);
+  var f3 = kn(svg, "fill", c3, 680);
+  down(svg, mid, sl, f3, ["listed buckets", "[R, 3p] int32"]);
+
+  // Tree or fixed
+  edge(svg, mid, [[design.r, 290], [c4, 290], [c4, 358]], true);
+  clab(svg, 808, 282, "fixed or tree");
+  var m0 = tn(svg, "torch.mm", "start level scores", c4, 380);
+  var wk = kn(svg, "widekeep", c4, 470);
+  down(svg, mid, m0, wk, ["scores", "[R, 32,768] fp32"]);
+  var bm = kn(svg, "beam", c4, 580);
+  down(svg, mid, wk, bm, ["kept children", "[R, 2048 x 4] int32"]);
+  S("path", { d: "M" + bm.l + "," + (bm.cy - 8) + "H" + (bm.l - 30) + "V" + (bm.cy + 14) + "H" + (bm.l - 2), "class": "arrow", "stroke-dasharray": "6 4", "marker-end": "url(#" + mid + ")" }, svg);
+  txt(svg, bm.l - 38, bm.cy + 10, "once per level", "condlab", "end");
+  var m1 = tn(svg, "torch.mm", "uncovered buckets", c4, 690);
+  down(svg, mid, bm, m1, ["level 0 children", "[R, 2048 x 4] int32"]);
+  var pk = kn(svg, "pick", c4, 790);
+  down(svg, mid, m1, pk, ["uncovered scores", "[R, uncovered] fp32"]);
+  var f4 = kn(svg, "fill", c4, 890);
+  down(svg, mid, pk, f4, ["picked buckets", "[R, p] int64"]);
+
+  // End
+  var end = pill(svg, "read list [R, 4,612] int32 -> sparse attention", 560, 1190, 470);
+  edge(svg, mid, [[c1, f1.b], [c1, 1190], [end.l, 1190]]);
+  dataLab(svg, c1 + 9, f1.b, 1190, ["read list", "[R, 4,612] int32"]);
+  edge(svg, mid, [[c2, inord.b], [c2, end.t]]);
+  txt(svg, c2 + 9, 1157, "read list [R, 4,612]", "edgelab");
+  edge(svg, mid, [[c3, f3.b], [c3, end.t]]);
+  dataLab(svg, c3 + 9, 704, 1170, ["read list", "[R, 4,612] int32"]);
+  edge(svg, mid, [[c4, f4.b], [c4, 1190], [end.r, 1190]]);
+  dataLab(svg, c4 + 9, f4.b, 1190, ["read list", "[R, 4,612] int32"]);
+}
+
+function drawDecode() {
+  var svg = $("#flow-decode"), mid = flowSvg(svg, 1100, 940);
+  var c1 = 300, c2 = 800;
+  var start = pill(svg, "a decode step: one index query per request, B requests", 560, 30, 520);
+  edge(svg, mid, [[560, start.b], [560, 76]]);
+  txt(svg, 570, 68, "new key, index query [B, 64] bf16", "edgelab");
+  maintain(svg, mid, "Maintain the index, eager, before the forward");
+  var mode = dn(svg, ["decode mode?"], 560, 290, 100, 36);
+  edge(svg, mid, [[560, 188], [560, mode.t]]);
+  dataLab(svg, 570, 188, mode.t, ["bucket centroids through pages"]);
+
+  container(svg, 190, 352, 300, 486, "Inside the CUDA graph");
+  container(svg, 690, 352, 360, 410, "Eager, outside the graph");
+  edge(svg, mid, [[mode.l, 290], [c1, 290], [c1, 396]], true);
+  clab(svg, 380, 282, "flat");
+  edge(svg, mid, [[mode.r, 290], [c2, 290], [c2, 396]], true);
+  clab(svg, 730, 282, "descend");
+  txt(svg, 730, 322, "fixed, tree", "tag", "middle");
+
+  var sa = kn(svg, "dsample", c1, 420), th = kn(svg, "dthreshold", c1, 510), sc = kn(svg, "dscan", c1, 600), od = kn(svg, "dorder", c1, 690);
+  down(svg, mid, sa, th, ["sample words", "[B, n_s]"]);
+  down(svg, mid, th, sc, ["threshold", "[B]"]);
+  down(svg, mid, sc, od, ["staged keys", "span counts"]);
+  var f1 = kn(svg, "fill", c1, 780, { unprofiled: true });
+  down(svg, mid, od, f1, ["keys, bucket order", "[B, 3p] int64"]);
+
+  var wk = kn(svg, "widekeep", c2, 420, { unprofiled: true });
+  var bm = kn(svg, "beam", c2, 520, { unprofiled: true });
+  down(svg, mid, wk, bm, ["kept children", "[B, 2048 x 4] int32"]);
+  loopRight(svg, mid, bm, "once per level");
+  var pk = kn(svg, "pick", c2, 620, { unprofiled: true });
+  down(svg, mid, bm, pk, ["kept children", "[B, 2048 x 4] int32"]);
+  var f2 = kn(svg, "fill", c2, 720, { unprofiled: true });
+  down(svg, mid, pk, f2, ["picked buckets", "[B, p] int64"]);
+
+  var end = pill(svg, "read list [B, 4,612] int32 -> sparse attention", 550, 900, 560);
+  edge(svg, mid, [[c1, f1.b], [c1, end.t]]);
+  dataLab(svg, c1 + 9, 840, end.t, ["read list", "[B, 4,612] int32"]);
+  edge(svg, mid, [[c2, f2.b], [c2, end.t]]);
+  dataLab(svg, c2 + 9, f2.b, end.t, ["read list", "[B, 4,612] int32"]);
+}
+drawFunnel();
+drawPrefill();
+drawDecode();
+
+/* ---------- where the time goes ---------- */
+function segStyle(si, v) {
+  var c = "var(--s" + si + ")", pale = "color-mix(in srgb, " + c + " 45%, var(--panel))";
+  if (v === 0) return "background:" + c;
+  if (v === 1) return "background:repeating-linear-gradient(45deg," + c + " 0 6px," + pale + " 6px 12px)";
+  if (v === 2) return "background:color-mix(in srgb, " + c + " 50%, var(--panel))";
+  return "background:repeating-linear-gradient(-45deg," + c + " 0 3px," + pale + " 3px 6px)";
+}
+var BAR_PATHS = [
+  { name: "Flat prefill chunk", about: "one chunk of 32,768 queries, the read", segs: [["Threshold estimate", ["samplepass", "threshold"]], ["Bucket scan", ["listing"]], ["Candidate scoring", ["listed"]], ["Expansion (by threshold)", ["fill"]]] },
+  { name: "Tree prefill chunk, per level", about: "the beam step repeats once per level", segs: [["Start-level keep", ["widekeep"]], ["One beam step", ["beam"]], ["Top-p pick", ["pick"]], ["Expansion (by threshold)", ["fill"]]] },
+  { name: "Flat decode step", about: "expansion is not profiled at decode, so it is left out", segs: [["Sample", ["dsample"]], ["Threshold", ["dthreshold"]], ["Scan", ["dscan"]], ["Order", ["dorder"]]] },
+  { name: "Growth", about: "Ward clustering runs per closed block, node-bucket clustering per growth, so they do not always run together", segs: [["Ward clustering, per chunk", ["ward"]], ["Node-bucket clustering, per growth", ["pairing"]]] }
+];
+var BAR_TOTALS = {};
+function drawBars() {
+  var host = $("#bars");
+  if (MAXCTX === null) { host.appendChild(el("p", { "class": "empty" }, ["No kernel records in this profile."])); return; }
+  BAR_PATHS.forEach(function (path) {
+    var segs = [], used = {};
+    path.segs.forEach(function (s) {
+      var ns = 0, found = false, cardId = s[1][0];
+      s[1].forEach(function (id) { var t = timeAt(id, MAXCTX); if (t) { ns += t.ns; found = true; } });
+      if (!found) return;
+      var si = STAGE_INDEX[CARD_BY_ID[cardId].stage];
+      used[si] = (used[si] === undefined ? -1 : used[si]) + 1;
+      segs.push({ label: s[0], ns: ns, si: si, v: used[si] % 4, ids: s[1] });
+    });
+    if (!segs.length) return;
+    var total = segs.reduce(function (a, s) { return a + s.ns; }, 0);
+    BAR_TOTALS[path.name] = { total: total, segs: segs };
+    var bar = el("div", { "class": "bar", role: "img", "aria-label": path.name + ", total " + fmtUs(total) });
+    var key = el("ul", { "class": "barkey" });
+    segs.forEach(function (s) {
+      var d = el("div", {});
+      d.style.cssText = segStyle(s.si, s.v) + ";flex:" + (s.ns / total) + " 1 0";
+      attachTip(d, function () { return [s.label, path.name, ["time", fmtUs(s.ns)], ["share", pct(s.ns / total * 100)]]; });
+      bar.appendChild(d);
+      var sw = el("i", {});
+      sw.style.cssText = segStyle(s.si, s.v);
+      key.appendChild(el("li", {}, [sw, s.label, el("span", { "class": "v" }, [fmtUs(s.ns) + ", " + pct(s.ns / total * 100)])]));
+    });
+    host.appendChild(el("div", { "class": "barrow" }, [
+      el("div", { "class": "barhead" }, [el("b", {}, [path.name]), el("span", {}, ["total " + fmtUs(total) + " - " + path.about])]),
+      bar, key
+    ]));
+  });
+  takeaways();
+}
+function takeaways() {
+  var out = [], flat = BAR_TOTALS["Flat prefill chunk"], dec = BAR_TOTALS["Flat decode step"];
+  function seg(p, label) { return p ? p.segs.filter(function (s) { return s.label === label; })[0] : null; }
+  var listing = seg(flat, "Bucket scan");
+  if (listing) out.push("The bucket scan is " + (listing.ns / flat.total * 100).toFixed(0) + "% of a flat chunk's read at " + ctxLabel(MAXCTX) + " (" + fmtUs(listing.ns) + " of " + fmtUs(flat.total) + ").");
+  var lower = CONTEXTS.filter(function (c) { return c < MAXCTX && timeAt("listed", c); });
+  var hiL = timeAt("listed", MAXCTX), loC = lower.length ? (lower.indexOf(1048576) >= 0 ? 1048576 : lower[lower.length - 1]) : null, loL = loC === null ? null : timeAt("listed", loC);
+  if (hiL && loL && hiL.sm !== null && loL.sm !== null && hiL.dramPct !== null && loL.dramPct !== null) {
+    var flips = loL.sm > loL.dramPct && hiL.dramPct > hiL.sm;
+    out.push(flips
+      ? "Candidate scoring goes from SM-bound to DRAM-bound between " + ctxLabel(loC) + " and " + ctxLabel(MAXCTX) + " (DRAM " + pct(loL.dramPct) + " -> " + pct(hiL.dramPct) + ", SM " + pct(loL.sm) + " -> " + pct(hiL.sm) + ")."
+      : "Candidate scoring's DRAM throughput goes from " + pct(loL.dramPct) + " to " + pct(hiL.dramPct) + " between " + ctxLabel(loC) + " and " + ctxLabel(MAXCTX) + ".");
+  }
+  var scan = timeAt("dscan", MAXCTX);
+  if (dec && scan && scan.gbps !== null) out.push("A decode step's select takes " + fmtUs(dec.total) + " at " + ctxLabel(MAXCTX) + ", its scan streaming " + Math.round(scan.gbps).toLocaleString("en-US") + " GB/s.");
+  var gw = timeAt("ward", MAXCTX), gp = timeAt("pairing", MAXCTX);
+  var sms = [gw, gp].filter(function (t) { return t && t.sm !== null; }).map(function (t) { return t.sm; });
+  if (sms.length) out.push("The growth kernels are latency-bound at under " + (Math.floor(Math.max.apply(null, sms)) + 1) + "% SM" + (gw && gp ? " (Ward clustering " + pct(gw.sm) + ", node-bucket clustering " + pct(gp.sm) + ")" : "") + ".");
+  var ul = $("#takeaways");
+  out.forEach(function (t) { ul.appendChild(el("li", {}, [t])); });
+}
+drawBars();
+
+/* ---------- the Triton kernels ---------- */
+function ownKernel(k, kernels) { return kernels === "cutedsl" ? k.cutedsl : k.triton; }
+var GROUPS_BY_KERNELS = { cutedsl: {}, triton: {} };
+ALLK.forEach(function (k) {
+  var g = GROUPS_BY_KERNELS[k.kernels], key = k.step + "@" + k.context;
+  (g[key] = g[key] || []).push(k);
+});
+// A step's kernel replay: its own kernels' time. The reference GEMM is a torch call, so all its launches count
+function replayNs(kernels, step, ctx) {
+  var recs = (GROUPS_BY_KERNELS[kernels][step + "@" + ctx] || []).filter(function (k) { return k.ns !== null && (step === "reference gemm" || ownKernel(k, kernels)); });
+  return recs.length ? recs.reduce(function (a, k) { return a + k.ns; }, 0) : null;
+}
+function wallMs(kernels, step, ctx) {
+  var hit = ALLSTEPS.filter(function (s) { return s.kernels === kernels && s.step === step && s.context === ctx && s.ms !== null; })[0];
+  return hit ? hit.ms : null;
+}
+function stepContexts(step) {
+  return CONTEXTS.filter(function (c) { return wallMs("cutedsl", step, c) !== null || replayNs("cutedsl", step, c) !== null; });
+}
+// One Triton point per step and context: its launches summed
+var TRI_POINTS = (function () {
+  var out = [];
+  Object.keys(GROUPS_BY_KERNELS.triton).forEach(function (key) {
+    var recs = GROUPS_BY_KERNELS.triton[key].filter(function (k) { return k.triton && k.ns !== null && k.stage !== "anchor"; });
+    if (!recs.length) return;
+    var ns = 0, fl = 0, dram = 0, l2 = 0, pipes = { bf16: 0, tf32: 0, fp8: 0, fp32: 0 }, have = { f: false, d: false, l: false }, w = { sm: 0, mem: 0, dram: 0, l2: 0 };
+    recs.forEach(function (k) {
+      ns += k.ns;
+      Object.keys(pipes).forEach(function (p) { pipes[p] += k.pipes[p]; });
+      if (k.flops !== null) { fl += k.flops; have.f = true; }
+      if (k.dramBytes !== null) { dram += k.dramBytes; have.d = true; }
+      if (k.l2Bytes !== null) { l2 += k.l2Bytes; have.l = true; }
+      w.sm += (k.sm || 0) * k.ns; w.mem += (k.mem || 0) * k.ns; w.dram += (k.dramPct || 0) * k.ns; w.l2 += (k.l2Pct || 0) * k.ns;
+    });
+    var secs = ns * 1e-9, first = recs[0];
+    out.push({
+      tri: true, step: first.step, stage: first.stage, context: first.context, label: "Triton " + stepName(first.step), ns: ns, launches: recs.length, pipes: pipes,
+      flops: have.f ? fl : null, fps: have.f ? fl / secs : null,
+      iD: have.f && have.d && dram ? fl / dram : null, iL: have.f && have.l && l2 ? fl / l2 : null,
+      gbps: have.d ? dram / secs / 1e9 : null,
+      sm: w.sm / ns, mem: w.mem / ns, dramPct: w.dram / ns, l2Pct: w.l2 / ns
+    });
+  });
+  return out;
+})();
+function cuteNs(step, ctx) { return replayNs("cutedsl", step, ctx); }
+
+/* ---------- cutedsl against triton ---------- */
+var vs = { context: MAXCTX, mode: "replay" };
+function ratioText(r) { return r >= 10 ? r.toFixed(1) + "x" : r.toFixed(2) + "x"; }
+function timeTick(v) { return v >= 1e6 ? (v / 1e6) + " ms" : v >= 1e3 ? (v / 1e3) + " us" : v + " ns"; }
+function vsRows() {
+  var steps = Array.from(new Set(ALLSTEPS.map(function (s) { return s.step; }).concat(ALLK.map(function (k) { return k.step; })))).filter(function (n) { return n && n !== "reference gemm"; });
+  var rows = [];
+  function make(step) {
+    var cs = stepContexts(step);
+    var ctx = cs.indexOf(vs.context) >= 0 ? vs.context : (cs.length === 1 ? cs[0] : null);
+    if (ctx === null) return null;
+    var c = vs.mode === "replay" ? replayNs("cutedsl", step, ctx) : (wallMs("cutedsl", step, ctx) === null ? null : wallMs("cutedsl", step, ctx) * 1e6);
+    var t = vs.mode === "replay" ? replayNs("triton", step, ctx) : (wallMs("triton", step, ctx) === null ? null : wallMs("triton", step, ctx) * 1e6);
+    if (c === null || t === null || c <= 0) return null;
+    var cr = replayNs("cutedsl", step, ctx), tr = replayNs("triton", step, ctx), cw = wallMs("cutedsl", step, ctx), tw = wallMs("triton", step, ctx);
+    return { step: step, stage: STAGE_OF[step] || (ALLSTEPS.filter(function (s) { return s.step === step; })[0] || {}).stage || "prefill scan", ctx: ctx, cute: c, tri: t, ratio: t / c, cr: cr, tr: tr, cw: cw, tw: tw };
+  }
+  steps.forEach(function (n) { var r = make(n); if (r) rows.push(r); });
+  rows.sort(function (a, b) { return b.ratio - a.ratio; });
+  return { rows: rows, control: make("reference gemm") };
+}
+function vsName(r) { return stepName(r.step) + (r.ctx !== vs.context ? " (at " + ctxLabel(r.ctx) + ")" : ""); }
+function vsSentence(rows) {
+  if (!rows.length) return "No step has both languages at " + ctxLabel(vs.context) + ".";
+  var tie = 0.03, wins = rows.filter(function (r) { return r.ratio >= 1 + tie; }), losses = rows.filter(function (r) { return r.ratio <= 1 - tie; }), ties = rows.filter(function (r) { return Math.abs(r.ratio - 1) < tie; });
+  var best = rows[0], by = vs.mode === "replay" ? "kernel replay" : "wall time";
+  function fmt(ns) { return fmtUs(ns); }
+  var out = "At " + ctxLabel(vs.context) + ", by " + by + ", CuTeDSL is faster in " + wins.length + " of " + rows.length + " steps, the biggest win being " + vsName(best) + " at " + ratioText(best.ratio) + " (" + fmt(best.cute) + " against " + fmt(best.tri) + " for Triton).";
+  out += losses.length ? " Triton is faster in " + losses.map(function (r) { return vsName(r) + " (" + ratioText(r.ratio) + ")"; }).join(", ") + "." : " Triton is faster in no step.";
+  if (ties.length) { var names = ties.map(vsName).join(", "); out += " " + names.charAt(0).toUpperCase() + names.slice(1) + (ties.length > 1 ? " are ties" : " is a tie") + " within " + (tie * 100) + "%."; }
+  return out;
+}
+function drawVersus() {
+  var svg = $("#vs-svg"); clear(svg);
+  var data = vsRows(), rows = data.rows, ctl = data.control;
+  $("#vs-sentence").textContent = vsSentence(rows);
+  var RH = 30, W = 960, m = { l: 230, r: 200, t: 34, b: 40 };
+  var all = rows.concat(ctl ? [ctl] : []);
+  var H = m.t + all.length * RH + (ctl ? 16 : 0) + m.b;
+  svg.setAttribute("viewBox", "0 0 " + W + " " + H);
+  if (!all.length) return emptyChart(svg, W, 120, "No step has both languages at this context");
+  var vals = [];
+  all.forEach(function (r) { vals.push(r.cute, r.tri); });
+  var lo = Math.pow(10, Math.floor(Math.log10(Math.min.apply(null, vals)))), hi = Math.pow(10, Math.ceil(Math.log10(Math.max.apply(null, vals))));
+  if (hi <= lo) hi = lo * 10;
+  var X = makeScale(lo, hi, m.l, W - m.r, true);
+  var yEnd = m.t + all.length * RH + (ctl ? 16 : 0);
+  logTicks(lo, hi).forEach(function (v) {
+    [1, 2, 5].forEach(function (f) {
+      if (v * f > hi) return;
+      S("line", { x1: X(v * f), x2: X(v * f), y1: m.t - 4, y2: yEnd, "class": "gridline", style: f === 1 ? "" : "opacity:0.5" }, svg);
+      if (f === 1) S("text", { x: X(v * f), y: yEnd + 16, "text-anchor": "middle", "class": "tick", text: timeTick(v * f) }, svg);
+    });
+  });
+  S("text", { x: (m.l + W - m.r) / 2, y: yEnd + 34, "text-anchor": "middle", "class": "axlab", text: (vs.mode === "replay" ? "Kernel replay time of the step" : "Median wall time of the step") + " (log scale)" }, svg);
+  S("text", { x: W - m.r + 14, y: m.t - 12, "class": "axlab", text: "Triton / CuTeDSL" }, svg);
+  S("text", { x: 8, y: m.t - 12, "class": "axlab", text: "Step" }, svg);
+  all.forEach(function (r, i) {
+    var isCtl = ctl && r === ctl;
+    var y = m.t + i * RH + RH / 2 + (isCtl ? 16 : 0), si = STAGE_INDEX[r.stage], color = cssVar(si);
+    if (isCtl) S("line", { x1: 8, x2: W - 8, y1: y - RH / 2 - 8, y2: y - RH / 2 - 8, "class": "anchorline" }, svg);
+    S("line", { x1: 8, x2: W - 8, y1: y + RH / 2, y2: y + RH / 2, "class": "gridline", style: "opacity:0.5" }, svg);
+    var gl = S("path", { d: shapePath(STAGES[si].shape, 4.5), transform: "translate(16," + y + ")", style: "fill:" + color }, svg);
+    S("text", { x: 30, y: y + 4, "class": "nodetxt", text: isCtl ? "reference gemm (control)" : vsName(r) }, svg);
+    var xc = X(r.cute), xt = X(r.tri);
+    S("line", { x1: xc, x2: xt, y1: y, y2: y, style: "stroke:" + color + ";stroke-width:2;opacity:0.55" }, svg);
+    S("path", { d: shapePath(STAGES[si].shape, 5.5), transform: "translate(" + xt + "," + y + ")", style: "fill:var(--panel);stroke:" + color + ";stroke-width:2" }, svg);
+    S("path", { d: shapePath(STAGES[si].shape, 5.5), transform: "translate(" + xc + "," + y + ")", style: "fill:" + color + ";stroke:var(--panel);stroke-width:1" }, svg);
+    var verdict = Math.abs(r.ratio - 1) < 0.03 ? "tie" : r.ratio > 1 ? "CuTeDSL faster" : "Triton faster";
+    S("text", { x: W - m.r + 14, y: y + 4, "class": "cnt", style: r.ratio < 0.97 ? "font-weight:600" : "", text: ratioText(r.ratio) }, svg);
+    S("text", { x: W - m.r + 64, y: y + 4, "class": "tag", text: verdict }, svg);
+    var hit = S("rect", { x: 0, y: y - RH / 2, width: W, height: RH, fill: "transparent", tabindex: "0", "aria-label": (isCtl ? "reference gemm" : vsName(r)) + ": CuTeDSL " + fmtUs(r.cute) + ", Triton " + fmtUs(r.tri) + ", ratio " + ratioText(r.ratio) }, svg);
+    attachTip(hit, function () {
+      var l = [isCtl ? "reference gemm (control)" : stepName(r.step), r.stage, ["context", ctxLabel(r.ctx)], ["CuTeDSL " + (vs.mode === "replay" ? "replay" : "wall"), fmtUs(r.cute)], ["Triton " + (vs.mode === "replay" ? "replay" : "wall"), fmtUs(r.tri)], ["Triton / CuTeDSL", ratioText(r.ratio)]];
+      var oc = vs.mode === "replay" ? r.cw : r.cr, ot = vs.mode === "replay" ? r.tw : r.tr;
+      if (oc !== null && ot !== null) {
+        var f = vs.mode === "replay" ? 1e6 : 1;
+        l.push(["other: CuTeDSL " + (vs.mode === "replay" ? "wall" : "replay"), fmtUs(oc * f)], ["other: Triton " + (vs.mode === "replay" ? "wall" : "replay"), fmtUs(ot * f)]);
+      }
+      return l;
+    });
+  });
+  tableInto($("#vs-table"), ["Step", "Context", "CuTeDSL replay", "Triton replay", "Replay ratio", "CuTeDSL wall", "Triton wall", "Wall ratio"], all.map(function (r) {
+    return [stepName(r.step), ctxLabel(r.ctx), r.cr === null ? "n/a" : fmtUs(r.cr), r.tr === null ? "n/a" : fmtUs(r.tr), r.cr && r.tr ? ratioText(r.tr / r.cr) : "n/a", r.cw === null ? "n/a" : sig(r.cw) + " ms", r.tw === null ? "n/a" : sig(r.tw) + " ms", r.cw && r.tw ? ratioText(r.tw / r.cw) : "n/a"];
+  }), 2);
+}
+(function versusControls() {
+  var sec = $("#versus");
+  if (!HAS_TRITON) { sec.style.display = "none"; return; }
+  $("#vs-legend").appendChild(filledKey());
+  $("#vs-legend").appendChild(hollowKey());
+  var sel = $("#vs-context");
+  CONTEXTS.forEach(function (c) { sel.appendChild(el("option", { value: String(c) }, [ctxLabel(c)])); });
+  sel.value = String(MAXCTX);
+  sel.addEventListener("change", function () { vs.context = Number(sel.value); drawVersus(); });
+  Array.prototype.forEach.call(document.querySelectorAll("input[name=vsmode]"), function (r) {
+    r.addEventListener("change", function () { if (r.checked) { vs.mode = r.value; drawVersus(); } });
+  });
+  drawVersus();
+})();
+
+/* ---------- against another GPU ---------- */
+(function compare() {
+  var OTHER = null;
+  try { OTHER = JSON.parse(document.getElementById("compare-data").textContent); } catch (e) { OTHER = null; }
+  if (!OTHER || !OTHER.steps) return;
+  var sec = $("#compare");
+  sec.hidden = false;
+  var om = OTHER.machine || {}, thisLabel = GPU || "this GPU", otherLabel = gpuLabel(om) || "the other GPU";
+  Array.prototype.forEach.call(document.querySelectorAll(".cmp-other"), function (e) { e.textContent = otherLabel; });
+  function rowsOf(steps) {
+    return steps.map(function (s) { return { step: s.step || "", context: num(s.context), ms: pick(s.median_ms), kernels: s.kernels === "triton" ? "triton" : "cutedsl", follows: s.follows_context }; });
+  }
+  var mine = rowsOf(RAW.steps || []), theirs = rowsOf(OTHER.steps);
+  function at(rows, kernels, step, ctx) {
+    var hit = rows.filter(function (r) { return r.kernels === kernels && r.step === step && r.ms !== null && (ctx === null || r.context === ctx); });
+    return hit.length ? hit[hit.length - 1] : null;
+  }
+  var ctxs = Array.from(new Set(mine.map(function (r) { return r.context; }).filter(function (c) { return c !== null && theirs.some(function (o) { return o.context === c; }); }))).sort(function (a, b) { return a - b; });
+  var cmp = { context: ctxs.length ? ctxs[ctxs.length - 1] : null, kernels: "cutedsl" };
+  function cmpRows() {
+    var names = Array.from(new Set(mine.map(function (r) { return r.step; })));
+    var out = [];
+    names.forEach(function (step) {
+      var a = at(mine, cmp.kernels, step, cmp.context), b = at(theirs, cmp.kernels, step, cmp.context);
+      if (!a || !b) {
+        // A step whose shapes do not follow the context ran at one context only
+        var fixedMine = mine.filter(function (r) { return r.step === step && r.follows === false; }).length;
+        if (!fixedMine) return;
+        a = at(mine, cmp.kernels, step, null); b = at(theirs, cmp.kernels, step, null);
+      }
+      if (!a || !b || a.ms <= 0) return;
+      var other = cmp.kernels === "cutedsl" ? "triton" : "cutedsl";
+      var ao = at(mine, other, step, a.context), bo = at(theirs, other, step, b.context);
+      out.push({ step: step, stage: STAGE_OF[step] || "prefill scan", ctx: a.context, mine: a.ms, theirs: b.ms, ratio: b.ms / a.ms, mineOther: ao ? ao.ms : null, theirsOther: bo ? bo.ms : null });
+    });
+    out.sort(function (x, y) { return y.ratio - x.ratio; });
+    return out;
+  }
+  function name(r) { return r.step + (r.ctx !== cmp.context ? " (at " + ctxLabel(r.ctx) + ")" : ""); }
+  function draw() {
+    var svg = $("#cmp-svg"); clear(svg);
+    var rows = cmpRows();
+    var steps = rows.filter(function (r) { return r.step !== "reference gemm"; });
+    var faster = steps.filter(function (r) { return r.ratio >= 1.03; }), slower = steps.filter(function (r) { return r.ratio <= 0.97; });
+    var geo = steps.length ? Math.exp(steps.reduce(function (s, r) { return s + Math.log(r.ratio); }, 0) / steps.length) : null;
+    var sentence = steps.length ? "At " + ctxLabel(cmp.context) + " under kernels: " + cmp.kernels + ", " + thisLabel + " is faster than " + otherLabel + " in " + faster.length + " of " + steps.length + " steps, by " + ratioText(geo) + " in the geometric mean, the most on " + name(steps[0]) + " at " + ratioText(steps[0].ratio) + " (" + sig(steps[0].mine) + " ms against " + sig(steps[0].theirs) + " ms)." : "No step ran on both GPUs at this context.";
+    if (slower.length) sentence += " " + otherLabel + " is faster on " + slower.map(function (r) { return name(r) + " (" + ratioText(r.ratio) + ")"; }).join(", ") + ".";
+    $("#cmp-sentence").textContent = sentence;
+    var RH = 30, W = 960, m = { l: 230, r: 200, t: 34, b: 40 };
+    var H = m.t + rows.length * RH + m.b;
+    svg.setAttribute("viewBox", "0 0 " + W + " " + H);
+    if (!rows.length) return emptyChart(svg, W, 120, "No step ran on both GPUs at this context");
+    var vals = [];
+    rows.forEach(function (r) { vals.push(r.mine * 1e6, r.theirs * 1e6); });
+    var lo = Math.pow(10, Math.floor(Math.log10(Math.min.apply(null, vals)))), hi = Math.pow(10, Math.ceil(Math.log10(Math.max.apply(null, vals))));
+    if (hi <= lo) hi = lo * 10;
+    var X = makeScale(lo, hi, m.l, W - m.r, true), yEnd = m.t + rows.length * RH;
+    logTicks(lo, hi).forEach(function (v) {
+      [1, 2, 5].forEach(function (f) {
+        if (v * f > hi) return;
+        S("line", { x1: X(v * f), x2: X(v * f), y1: m.t - 4, y2: yEnd, "class": "gridline", style: f === 1 ? "" : "opacity:0.5" }, svg);
+        if (f === 1) S("text", { x: X(v * f), y: yEnd + 16, "text-anchor": "middle", "class": "tick", text: timeTick(v * f) }, svg);
+      });
+    });
+    S("text", { x: (m.l + W - m.r) / 2, y: yEnd + 34, "text-anchor": "middle", "class": "axlab", text: "Median wall time of the step (log scale)" }, svg);
+    S("text", { x: W - m.r + 14, y: m.t - 12, "class": "axlab", text: otherLabel + " / " + thisLabel }, svg);
+    S("text", { x: 8, y: m.t - 12, "class": "axlab", text: "Step" }, svg);
+    rows.forEach(function (r, i) {
+      var y = m.t + i * RH + RH / 2, si = STAGE_INDEX[r.stage], color = cssVar(si);
+      S("line", { x1: 8, x2: W - 8, y1: y + RH / 2, y2: y + RH / 2, "class": "gridline", style: "opacity:0.5" }, svg);
+      S("path", { d: shapePath(STAGES[si].shape, 4.5), transform: "translate(16," + y + ")", style: "fill:" + color }, svg);
+      S("text", { x: 30, y: y + 4, "class": "nodetxt", text: r.step === "reference gemm" ? "reference gemm (cuBLAS)" : name(r) }, svg);
+      var xa = X(r.mine * 1e6), xb = X(r.theirs * 1e6);
+      S("line", { x1: xa, x2: xb, y1: y, y2: y, style: "stroke:" + color + ";stroke-width:2;opacity:0.55" }, svg);
+      S("path", { d: shapePath(STAGES[si].shape, 5.5), transform: "translate(" + xb + "," + y + ")", style: "fill:var(--panel);stroke:" + color + ";stroke-width:2" }, svg);
+      S("path", { d: shapePath(STAGES[si].shape, 5.5), transform: "translate(" + xa + "," + y + ")", style: "fill:" + color + ";stroke:var(--panel);stroke-width:1" }, svg);
+      S("text", { x: W - m.r + 14, y: y + 4, "class": "cnt", style: r.ratio < 0.97 ? "font-weight:600" : "", text: ratioText(r.ratio) }, svg);
+      S("text", { x: W - m.r + 64, y: y + 4, "class": "tag", text: Math.abs(r.ratio - 1) < 0.03 ? "tie" : r.ratio > 1 ? thisLabel + " faster" : otherLabel + " faster" }, svg);
+      var hit = S("rect", { x: 0, y: y - RH / 2, width: W, height: RH, fill: "transparent", tabindex: "0", "aria-label": name(r) + ": " + thisLabel + " " + sig(r.mine) + " ms, " + otherLabel + " " + sig(r.theirs) + " ms" }, svg);
+      attachTip(hit, function () {
+        return [r.step, r.stage, ["context", ctxLabel(r.ctx)], [thisLabel + " " + cmp.kernels, sig(r.mine) + " ms"], [otherLabel + " " + cmp.kernels, sig(r.theirs) + " ms"], [otherLabel + " / " + thisLabel, ratioText(r.ratio)]];
+      });
+    });
+    var other = cmp.kernels === "cutedsl" ? "triton" : "cutedsl";
+    tableInto($("#cmp-table"), ["Step", "Context", otherLabel + " " + cmp.kernels, thisLabel + " " + cmp.kernels, "Ratio", otherLabel + " " + other, thisLabel + " " + other, "Ratio"], rows.map(function (r) {
+      return [r.step, ctxLabel(r.ctx), sig(r.theirs) + " ms", sig(r.mine) + " ms", ratioText(r.ratio), r.theirsOther === null ? "n/a" : sig(r.theirsOther) + " ms", r.mineOther === null ? "n/a" : sig(r.mineOther) + " ms", r.theirsOther && r.mineOther ? ratioText(r.theirsOther / r.mineOther) : "n/a"];
+    }), 2);
+  }
+  var sel = $("#cmp-context");
+  ctxs.forEach(function (c) { sel.appendChild(el("option", { value: String(c) }, [ctxLabel(c)])); });
+  if (cmp.context !== null) sel.value = String(cmp.context);
+  sel.addEventListener("change", function () { cmp.context = Number(sel.value); draw(); });
+  Array.prototype.forEach.call(document.querySelectorAll("input[name=cmpkernels]"), function (r) {
+    r.addEventListener("change", function () { if (r.checked) { cmp.kernels = r.value; draw(); } });
+  });
+  draw();
+})();
+
+/* ---------- kernel cards ---------- */
+(function cards() {
+  var host = $("#cards-body");
+  STAGES.forEach(function (st, si) {
+    var inStage = CARDS.filter(function (c) { return c.stage === st.id; });
+    if (!inStage.length) return;
+    var head = el("div", { "class": "stagehead" }, [glyph(si, 16), el("h3", {}, [st.label + " (" + inStage.length + ")"])]);
+    head.firstChild.setAttribute("width", 16);
+    host.appendChild(head);
+    inStage.forEach(function (c) {
+      var art = el("article", { "class": "card", id: "k-" + c.id });
+      art.style.setProperty("--stage", cssVar(si));
+      art.appendChild(el("header", {}, [el("span", { "class": "cls" }, [c.short]), el("span", { "class": "stp" }, ["code: " + c.steps.map(function (s) { return s.step; }).join(", ") + " / " + c.cls + (cardBadge(c) ? "  (" + cardBadge(c).text + ")" : "")])]));
+      var left = el("div", {}, [el("p", {}, [c.does])]);
+      if (c.context) left.appendChild(el("p", { "class": "note" }, [c.context]));
+      art.appendChild(left);
+      var dl = el("dl", { "class": "spec" });
+      function row(k, v) { dl.appendChild(el("dt", {}, [k])); dl.appendChild(el("dd", {}, [typeof v === "string" ? v : v])); }
+      row("Inputs -> outputs", c.io);
+      row("Launch", c.launch);
+      var chips = el("div", { "class": "chips" }, c.hw.map(function (h) { return el("span", { "class": "hw" }, [h]); }));
+      row("Hardware", chips);
+      var cost = el("div", {}, c.cost.map(function (t) { return el("div", { "class": "mono" }, [t]); }));
+      row("Cost model", cost);
+      row("Expected bound", c.bound);
+      art.appendChild(dl);
+      art.appendChild(miniTable(c));
+      host.appendChild(art);
+    });
+  });
+})();
+function miniTable(card) {
+  var wrap = el("div", { "class": "mini" });
+  var cols = CONTEXTS.filter(function (ctx) { return cardRecords(card, ctx).length; });
+  if (!cols.length) { wrap.appendChild(el("p", { "class": "none" }, ["No measurement for this kernel in the loaded profile."])); return wrap; }
+  var table = el("table");
+  var thead = el("thead"), htr = el("tr", {}, [el("th", {}, ["Measured"])]);
+  cols.forEach(function (ctx) { htr.appendChild(el("th", {}, [ctxLabel(ctx)])); });
+  thead.appendChild(htr); table.appendChild(thead);
+  var data = cols.map(function (ctx) { return aggregate(cardRecords(card, ctx)); });
+  var rows = [["Duration", function (a) { return fmtUs(a.ns); }], ["Achieved TFLOP/s", function (a) { return fmtTflops(a.fps); }], ["DRAM GB/s", function (a) { return a.gbps === null ? "n/a" : sig(a.gbps); }], ["SM throughput", function (a) { return pct(a.sm); }], ["DRAM throughput", function (a) { return pct(a.dramPct); }]];
+  var tb = el("tbody");
+  rows.forEach(function (r) {
+    var tr = el("tr", {}, [el("th", { "class": "l" }, [r[0]])]);
+    data.forEach(function (a) { tr.appendChild(el("td", {}, [r[1](a)])); });
+    tb.appendChild(tr);
+  });
+  var stepNames = Array.from(new Set(card.steps.filter(function (s) { return !s.first; }).map(function (s) { return s.step; })));
+  var pairs = cols.map(function (ctx) {
+    var c = 0, t = 0, ok = stepNames.length > 0;
+    stepNames.forEach(function (n) { var a = replayNs("cutedsl", n, ctx), b = replayNs("triton", n, ctx); if (a === null || b === null) ok = false; else { c += a; t += b; } });
+    return ok && c > 0 ? { c: c, t: t } : null;
+  });
+  if (pairs.some(function (p) { return p; })) {
+    [["Step, CuTeDSL", function (p) { return fmtUs(p.c); }], ["Step, Triton", function (p) { return fmtUs(p.t); }], ["Triton / CuTeDSL", function (p) { return ratioText(p.t / p.c); }]].forEach(function (r) {
+      var tr = el("tr", {}, [el("th", { "class": "l" }, [r[0]])]);
+      pairs.forEach(function (p) { tr.appendChild(el("td", {}, [p ? r[1](p) : "n/a"])); });
+      tb.appendChild(tr);
+    });
+  }
+  table.appendChild(tb); wrap.appendChild(table);
+  if (pairs.some(function (p) { return p; })) wrap.appendChild(el("p", { "class": "note" }, ["The step rows sum every kernel of " + stepNames.map(stepName).join(" and ") + " in each language, torch launches left out, so they cover more than this card's kernel. Above 1, CuTeDSL is faster."]));
+  var launches = cols.map(function (ctx) { return cardRecords(card, ctx).length; });
+  if (launches.some(function (n) { return n > 1; })) wrap.appendChild(el("p", { "class": "note" }, ["Several launches match this card, so duration, FLOPs and bytes are summed and the percentages are weighted by duration."]));
+  return wrap;
+}
+function aggregate(recs) {
+  var ns = 0, fl = 0, by = 0, have = { f: false, b: false }, w = { sm: 0, dram: 0 }, ws = 0;
+  recs.forEach(function (k) {
+    if (k.ns === null) return;
+    ns += k.ns; ws += k.ns;
+    if (k.flops !== null) { fl += k.flops; have.f = true; }
+    if (k.dramBytes !== null) { by += k.dramBytes; have.b = true; }
+    w.sm += (k.sm || 0) * k.ns; w.dram += (k.dramPct || 0) * k.ns;
+  });
+  return { ns: ws ? ns : null, fps: ws && have.f ? fl / (ns * 1e-9) : null, gbps: ws && have.b ? by / (ns * 1e-9) / 1e9 : null, sm: ws ? w.sm / ws : null, dramPct: ws ? w.dram / ws : null };
+}
+
+/* ---------- tooltip ---------- */
+var tip = $("#tip");
+function showTip(lines, x, y) {
+  clear(tip);
+  lines.forEach(function (l, i) {
+    if (i === 0) tip.appendChild(el("b", {}, [l]));
+    else if (Array.isArray(l)) tip.appendChild(el("div", { "class": "r" }, [el("span", {}, [l[0]]), el("span", {}, [l[1]])]));
+    else tip.appendChild(el("div", {}, [l]));
+  });
+  tip.style.display = "block";
+  var w = tip.offsetWidth, h = tip.offsetHeight;
+  var nx = Math.min(x + 14, window.innerWidth - w - 8), ny = y + 14;
+  if (ny + h > window.innerHeight - 8) ny = Math.max(8, y - h - 14);
+  tip.style.left = Math.max(8, nx) + "px";
+  tip.style.top = ny + "px";
+}
+function hideTip() { tip.style.display = "none"; }
+function attachTip(target, linesFn) {
+  target.addEventListener("pointermove", function (e) { showTip(linesFn(), e.clientX, e.clientY); });
+  target.addEventListener("pointerleave", hideTip);
+  target.addEventListener("focus", function () { var r = target.getBoundingClientRect(); showTip(linesFn(), r.left + r.width / 2, r.top + r.height / 2); });
+  target.addEventListener("blur", hideTip);
+}
+document.addEventListener("keydown", function (e) { if (e.key === "Escape") hideTip(); });
+
+/* ---------- chart scaffolding ---------- */
+function makeScale(d0, d1, r0, r1, log) {
+  var a = log ? Math.log10(d0) : d0, b = log ? Math.log10(d1) : d1;
+  var f = function (v) { var t = log ? Math.log10(v) : v; return r0 + (t - a) / (b - a) * (r1 - r0); };
+  f.domain = [d0, d1];
+  return f;
+}
+function logTicks(d0, d1) {
+  var out = [];
+  for (var e = Math.ceil(Math.log10(d0) - 1e-9); e <= Math.floor(Math.log10(d1) + 1e-9); e++) out.push(Math.pow(10, e));
+  return out;
+}
+function sciLabel(v) { var e = Math.round(Math.log10(v)); return e === 0 ? "1" : e === 1 ? "10" : "1e" + e; }
+function flopsTick(v) {
+  var e = Math.round(Math.log10(v));
+  if (e >= 12) return Math.pow(10, e - 12) + " T";
+  if (e >= 9) return Math.pow(10, e - 9) + " G";
+  if (e >= 6) return Math.pow(10, e - 6) + " M";
+  return sciLabel(v);
+}
+function emptyChart(svg, W, H, msg) {
+  svg.setAttribute("viewBox", "0 0 " + W + " " + H);
+  S("text", { x: W / 2, y: H / 2, "text-anchor": "middle", "class": "axlab", text: msg }, svg);
+}
+function placeLabels(svg, items, box) {
+  var placed = [];
+  items.forEach(function (it) {
+    var w = it.text.length * 6.1, h = 12;
+    var offs = [[8, -7], [8, 14], [-8 - w, -7], [-8 - w, 14], [8, -20], [8, 26], [-8 - w, -20], [-8 - w, 26]];
+    for (var i = 0; i < offs.length; i++) {
+      var x = it.x + offs[i][0], y = it.y + offs[i][1];
+      var b = { x0: x, x1: x + w, y0: y - h, y1: y + 3 };
+      if (b.x0 < box.x0 || b.x1 > box.x1 || b.y0 < box.y0 || b.y1 > box.y1) continue;
+      if (placed.some(function (p) { return !(b.x1 < p.x0 || b.x0 > p.x1 || b.y1 < p.y0 || b.y0 > p.y1); })) continue;
+      if (it.pts.some(function (p) { return p.x > b.x0 - 5 && p.x < b.x1 + 5 && p.y > b.y0 - 5 && p.y < b.y1 + 5; })) continue;
+      placed.push(b);
+      S("text", { x: x, y: y, "class": "ptlab", text: it.text }, svg);
+      return;
+    }
+  });
+}
+
+/* ---------- filters ---------- */
+var state = { context: "all", axis: "dram", stages: {}, triton: true };
+STAGES.forEach(function (s) { state.stages[s.id] = true; });
+(function controls() {
+  var sel = $("#f-context");
+  sel.appendChild(el("option", { value: "all" }, ["All contexts"]));
+  CONTEXTS.forEach(function (c) { sel.appendChild(el("option", { value: String(c) }, [ctxLabel(c)])); });
+  sel.addEventListener("change", function () { state.context = sel.value; redraw(); });
+  var fs = $("#f-stage");
+  STAGES.forEach(function (s, i) {
+    var cb = el("input", { type: "checkbox", checked: "checked", id: "st-" + i });
+    cb.addEventListener("change", function () { state.stages[s.id] = cb.checked; redraw(); });
+    fs.appendChild(el("label", { "class": "chip", "for": "st-" + i }, [cb, glyph(i, 12), s.label]));
+  });
+  var tcb = $("#f-triton");
+  if (!HAS_TRITON) { $("#f-kernels").style.display = "none"; $("#rf-triton-note").style.display = "none"; }
+  tcb.addEventListener("change", function () { state.triton = tcb.checked; redraw(); });
+  Array.prototype.forEach.call(document.querySelectorAll("input[name=axis]"), function (r) {
+    r.addEventListener("change", function () { if (r.checked) { state.axis = r.value; redraw(); } });
+  });
+})();
+function passes(k) {
+  if (!state.stages[k.stage]) return false;
+  if (k.stage === "anchor") return true;
+  return state.context === "all" || String(k.context) === state.context;
+}
+function triPlotted() { return HAS_TRITON && state.triton ? TRI_POINTS.filter(passes) : []; }
+// The Triton point's partner is the nearest CuTeDSL point of the same step and context
+function partner(t, cands) {
+  var best = null, bd = Infinity;
+  cands.forEach(function (c) {
+    if (c.k.step !== t.k.step || c.k.context !== t.k.context) return;
+    var d = Math.pow(c.x - t.x, 2) + Math.pow(c.y - t.y, 2);
+    if (d < bd) { bd = d; best = c; }
+  });
+  return best;
+}
+function plotted() { return KERNELS.filter(function (k) { return (k.cutedsl || k.stage === "anchor") && passes(k); }); }
+function seriesOf(list) {
+  var map = {}, order = [];
+  list.forEach(function (k) {
+    var idxInGroup = (GROUPS[k.step + "@" + k.context] || []).indexOf(k);
+    var key = k.step + "#" + idxInGroup;
+    if (!map[key]) { map[key] = []; order.push(key); }
+    map[key].push(k);
+  });
+  return order.map(function (key) { return map[key].sort(function (a, b) { return (a.context || 0) - (b.context || 0); }); });
+}
+function boundOf(k, bw) {
+  var p = k.pipes, tot = p.bf16 + p.tf32 + p.fp8 + p.fp32;
+  var peak = M.fp32;
+  if (tot > 0) {
+    if (p.bf16 + p.fp8 >= p.tf32 && p.bf16 + p.fp8 >= p.fp32) peak = p.fp8 > p.bf16 ? M.fp8 : M.bf16;
+    else if (p.tf32 >= p.fp32) peak = M.tf32;
+  }
+  return { peak: peak, bw: bw };
+}
+function roofPct(k, x, bw) {
+  if (k.fps === null) return null;
+  var b = boundOf(k, bw), roof = null;
+  if (b.peak !== null && b.bw !== null) roof = Math.min(b.peak, b.bw * x);
+  else if (b.peak !== null) roof = b.peak;
+  return roof ? k.fps / roof * 100 : null;
+}
+function ctxTitle(k) { return k.stage === "anchor" ? "reference" : ctxLabel(k.context); }
+
+/* ---------- roofline ---------- */
+function drawRoofline() {
+  var svg = $("#rf-svg"); clear(svg);
+  var W = 900, H = 520, m = { l: 66, r: 150, t: 16, b: 52 };
+  svg.setAttribute("viewBox", "0 0 " + W + " " + H);
+  var mode = state.axis, key = mode === "dram" ? "iD" : "iL";
+  var bw = mode === "dram" ? M.hbm : M.l2;
+  var xs = plotted().filter(function (k) { return k.fps !== null && k.fps > 1e8 && k[key] !== null && k[key] > 0; });
+  var note = $("#rf-note");
+  var flat = plotted().filter(function (k) { return k.stage !== "anchor" && !(k.fps !== null && k.fps > 1e8); });
+  var flatNames = Array.from(new Set(flat.map(function (k) { return k.label; })));
+  var notes = [];
+  if (mode === "l2" && bw === null) notes.push("The profile has no measured L2 bandwidth, so the L2 slope is omitted and only the compute ceilings are drawn.");
+  if (flatNames.length) notes.push("No counted FLOPs, so they are not on this chart (see the speed of light chart): " + flatNames.join(", ") + ".");
+  if (M.ncuDram || M.ncuFp32) notes.push("Nsight Compute reports peaks of " + (M.ncuDram ? sig(M.ncuDram / 1e12) + " TB/s DRAM" : "") + (M.ncuDram && M.ncuFp32 ? " and " : "") + (M.ncuFp32 ? sig(M.ncuFp32 / 1e12) + " TFLOP/s FP32" : "") + ".");
+  note.textContent = notes.join(" ");
+  if (!KERNELS.length) return emptyChart(svg, W, H, "No kernel records in this profile");
+  var txs = triPlotted().filter(function (k) { return k.fps !== null && k.fps > 1e8 && k[key] !== null && k[key] > 0; });
+  var allI = xs.concat(txs).map(function (k) { return k[key]; });
+  var ridge = bw && M.bf16 ? M.bf16 / bw : 200;
+  var x0 = Math.pow(10, Math.floor(Math.log10(Math.min.apply(null, allI.concat([1])))) - 1), x1 = Math.pow(10, Math.ceil(Math.log10(Math.max.apply(null, allI.concat([ridge * 2]))))) ;
+  var yMin = xs.length ? Math.min.apply(null, xs.concat(txs).map(function (k) { return k.fps; })) : 1e9;
+  var y0 = Math.max(1e8, Math.pow(10, Math.floor(Math.log10(yMin)))), y1 = 3e15;
+  var X = makeScale(x0, x1, m.l, W - m.r, true), Y = makeScale(y0, y1, H - m.b, m.t, true);
+  logTicks(x0, x1).forEach(function (v) {
+    S("line", { x1: X(v), x2: X(v), y1: m.t, y2: H - m.b, "class": "gridline" }, svg);
+    S("text", { x: X(v), y: H - m.b + 16, "text-anchor": "middle", "class": "tick", text: sciLabel(v) }, svg);
+  });
+  logTicks(y0, y1).forEach(function (v) {
+    S("line", { x1: m.l, x2: W - m.r, y1: Y(v), y2: Y(v), "class": "gridline" }, svg);
+    S("text", { x: m.l - 8, y: Y(v) + 4, "text-anchor": "end", "class": "tick", text: flopsTick(v) }, svg);
+  });
+  S("rect", { x: m.l, y: m.t, width: W - m.l - m.r, height: H - m.t - m.b, fill: "none", "clas
