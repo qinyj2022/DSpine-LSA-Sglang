@@ -1,0 +1,104 @@
+at)scale);
+    return {dq32.to(torch::kBFloat16), dk32.to(torch::kBFloat16), dv32.to(torch::kBFloat16)};
+  }
+  const int NPq = 64 / G, nqt = (T + NPq - 1) / NPq, nw = (T + 31) / 32, nkb = (T + 127) / 128;
+  const int BH = B * HKV, n = BH * nkb;
+  const long nld = (long)BH * nqt * 64 * 2;
+  const long ndqp = (long)BH * nqt * 8192;
+  auto fbuf = torch::empty({ndqp + 2 * nkv + nld}, q.options().dtype(torch::kFloat32));
+  float* dq32 = fbuf.data_ptr<float>();
+  if (ndqp != nq) cudaMemsetAsync(dq32, 0, ndqp * 4, stream);
+  float* dk32 = dq32 + ndqp;
+  float* dv32 = dk32 + nkv;
+  float* LDp = dv32 + nkv;
+  if (T % NPq != 0) cudaMemsetAsync(LDp, 0, nld * 4, stream);
+  const int BQ = (int)target, nb = (nqt + BQ - 1) / BQ;
+  const long nseg = (long)nb * n;
+  const long nitm = (nseg + 4) * 4;
+  const long nST = (long)BH * nw * T, nOCC = (long)2 * n * nw, nLIST = (long)n * nqt;
+  auto ibuf = torch::empty({nitm + 4 + nST + nOCC + nLIST + 2 * n * (nb + 1)}, q.options().dtype(torch::kInt32));
+  int* ib = ibuf.data_ptr<int>();
+  int4* items = reinterpret_cast<int4*>(ib);
+  int* nit = ib + nitm;
+  unsigned* ST = reinterpret_cast<unsigned*>(nit + 4);
+  unsigned* OCC = ST + nST;
+  int* LIST = reinterpret_cast<int*>(OCC + nOCC);
+  int* CNT = LIST + nLIST;
+  const long nthr = (long)B * T * HQ * (D / 8);
+  delta_k<<<(int)((nthr + 255) / 256), 256, 0, stream>>>(reinterpret_cast<const bf16*>(o.data_ptr()),
+      reinterpret_cast<const bf16*>(dout.data_ptr()), lse.data_ptr<float>(), reinterpret_cast<float2*>(LDp),
+      dq32, dk32, dv32, nkv / 8, B, T, HQ, HKV, G, D, nqt, 1.4426950408889634f, (float)std::log2(scale));
+  const int CH = 32768;
+  const int bsm = std::min(T, CH) * 4;
+  static int bset = 0;
+  if (bsm > 48 * 1024 && bsm > bset) { cudaFuncSetAttribute(build2_k, cudaFuncAttributeMaxDynamicSharedMemorySize, bsm); bset = bsm; }
+  build2_k<<<dim3(nw, BH), 1024, bsm, stream>>>(sel.data_ptr<int>(), ST, OCC, T, TOPK, nw, nkb, CH);
+  int* BST = CNT;
+  int* BSK = BST + n * (nb + 1);
+  list2_k<<<dim3(nkb, BH), 256, 0, stream>>>(OCC, LIST, BST, T, NPq, nqt, nw, nkb, nb, BQ, (int)window, (int)sink, BSK);
+  items2_k<<<1, 1024, 0, stream>>>(BST, items, nit, BH, nkb, nb, (int)minL, BSK);
+  const int grid = (int)nseg;
+  const float sl2 = (float)(scale * 1.4426950408889634);
+  TORCH_CHECK(D == 128 && G == 8, "v1 supports D=128, G=8 only");
+  launch_main(q, k, v, dout, items, nit, LIST, ST, reinterpret_cast<const float2*>(LDp), dq32, dk32, dv32,
+              grid, nqt, nw, nkb, (int)window, (int)sink, sl2, (float)(1.0 / scale), stream);
+  auto dq = torch::empty_like(q);
+  auto dk = torch::empty_like(k);
+  auto dv = torch::empty_like(v);
+  cvt_k<<<(int)((nkv / 8 + 255) / 256), 256, 0, stream>>>(dq32, reinterpret_cast<bf16*>(dq.data_ptr()), 0,
+      dk32, reinterpret_cast<bf16*>(dk.data_ptr()), dv32, reinterpret_cast<bf16*>(dv.data_ptr()), nkv / 8);
+  const long ncv = (long)BH * nqt * 256;
+  (void)ncv;
+  cvt_dq2_k<<<dim3(nqt, BH), 256, 0, stream>>>(dq32, reinterpret_cast<bf16*>(dq.data_ptr()), T, HKV, nqt);
+  return {dq, dk, dv};
+}
+"""
+
+
+_RC = int(__import__("os").environ.get("SA_RCONS", "232"))
+_RP = 40 if _RC <= 232 else 24
+
+
+def _build():
+    src = HEADER + _gen("wg_ss_n64", 64, False) + _gen("wg_ss_n64_tt", 64, False, 1, 1)
+    src += _gen("wg_rs_n128_t", 128, True, 0, 1) + _gen("wg_rs_n64_t", 64, True, 0, 1)
+    src += r"""
+template <int NO> struct RsSel;
+template <> struct RsSel<64> { static __device__ __forceinline__ void run(float* d, const unsigned* a, unsigned long long db, int sd) { wg_rs_n128_t(d, a, db, sd); } };
+template <> struct RsSel<32> { static __device__ __forceinline__ void run(float* d, const unsigned* a, unsigned long long db, int sd) { wg_rs_n64_t(d, a, db, sd); } };
+#define wg_rs_nD(d, a, db, sd) RsSel<NO>::run(d, a, db, sd)
+"""
+    return f"#define RCONS {_RC}\n#define RPROD {_RP}\n" + src + KERN
+
+
+_ext = load_inline(
+    name="lsa_bwd_v14",
+    cpp_sources="std::vector<torch::Tensor> bwd(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor sel, "
+    "torch::Tensor o, torch::Tensor lse, torch::Tensor dout, int64_t window, int64_t sink, double scale, "
+    "int64_t target, int64_t minL);",
+    cuda_sources=_build() + HOST,
+    functions=["bwd"],
+    extra_cuda_cflags=["-O3", "--use_fast_math", "-gencode=arch=compute_90a,code=sm_90a", "-Xptxas=-v"],
+    verbose=bool(int(__import__("os").environ.get("SA_VERBOSE", "0"))),
+)
+
+import os as _os
+_BQ_FORCED = "SA_BQ" in _os.environ
+TARGET = int(_os.environ.get("SA_BQ", "256"))  # query tiles per band (default: 128 for t <= 16K, else 256)
+MINL = 0
+
+
+def attention_backward(q, k, v, selected, o, lse, do, window=0, sink=0, scale=None):
+    D = q.shape[-1]
+    scale = D ** -0.5 if scale is None else scale
+    if not q.is_contiguous(): q = q.contiguous()
+    if not k.is_contiguous(): k = k.contiguous()
+    if not v.is_contiguous(): v = v.contiguous()
+    if not o.is_contiguous(): o = o.contiguous()
+    if not do.is_contiguous(): do = do.contiguous()
+    if lse.dtype != torch.float32 or not lse.is_contiguous(): lse = lse.contiguous().float()
+    if selected.dtype != torch.int32: selected = selected.to(torch.int32)
+    if not selected.is_contiguous(): selected = selected.contiguous()
+    bq = TARGET if _BQ_FORCED else (128 if q.shape[1] <= 16384 else 256)
+    dq, dk, dv = _ext.bwd(q, k, v, selected, o, lse, do, int(window), int(sink), float(scale), bq, MINL)
+    return dq, dk, dv
