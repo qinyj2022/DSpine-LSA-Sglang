@@ -1,0 +1,535 @@
+<title>CuTeDSL Kernel Roofline</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+/* Layout: one wide column, ruled sections, cards as ruled rows with the stage's marker, charts in scrollable frames */
+:root {
+  --bg: #eff2f2;
+  --panel: #f9fbfb;
+  --ink: #131f29;
+  --ink2: #485964;
+  --rule: #c7d1d6;
+  --grid: #dde4e7;
+  --hover: #e4ebed;
+  --node: #ffffff;
+  --torch: #6b7a84;
+  --s0: #2a78d6;
+  --s1: #eb6834;
+  --s2: #1baf7a;
+  --s3: #eda100;
+  --s4: #e87ba4;
+  --s5: #6250d6;
+  --font: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0e151b;
+    --panel: #151e26;
+    --ink: #e3eaee;
+    --ink2: #9bacb7;
+    --rule: #2c3944;
+    --grid: #202c35;
+    --hover: #1d2933;
+    --node: #19232c;
+    --torch: #8798a3;
+    --s0: #3987e5;
+    --s1: #d95926;
+    --s2: #199e70;
+    --s3: #c98500;
+    --s4: #d55181;
+    --s5: #9085e9;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0e151b;
+  --panel: #151e26;
+  --ink: #e3eaee;
+  --ink2: #9bacb7;
+  --rule: #2c3944;
+  --grid: #202c35;
+  --hover: #1d2933;
+  --node: #19232c;
+  --torch: #8798a3;
+  --s0: #3987e5;
+  --s1: #d95926;
+  --s2: #199e70;
+  --s3: #c98500;
+  --s4: #d55181;
+  --s5: #9085e9;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font);
+  font-size: 15px;
+  line-height: 1.55;
+}
+.wrap {
+  max-width: 1160px;
+  margin: 0 auto;
+  padding-block: 28px 64px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+}
+h1, h2, h3 { text-wrap: balance; line-height: 1.2; margin: 0; }
+h1 { font-size: clamp(28px, 5vw, 40px); font-weight: 600; letter-spacing: -0.01em; }
+h2 { font-size: 22px; font-weight: 600; }
+h3 { font-size: 16px; font-weight: 600; }
+p { margin: 0; max-width: 72ch; }
+.mono, code { font-family: var(--mono); font-size: 0.92em; }
+.num { font-variant-numeric: tabular-nums; }
+.lede { color: var(--ink2); font-size: 17px; margin-top: 10px; max-width: 64ch; }
+.eyebrow { font-family: var(--mono); font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink2); }
+header { display: grid; gap: 4px; padding-bottom: 22px; border-bottom: 2px solid var(--ink); }
+.facts { display: flex; flex-wrap: wrap; gap: 8px 28px; margin: 16px 0 0; padding: 0; list-style: none; }
+.facts li { display: grid; gap: 0; min-width: 0; }
+.facts b { font-family: var(--mono); font-weight: 500; font-size: 20px; font-variant-numeric: tabular-nums; }
+.facts span { font-size: 12px; color: var(--ink2); letter-spacing: 0.04em; text-transform: uppercase; }
+section { margin-top: 52px; display: grid; gap: 14px; min-width: 0; }
+section > h2 { padding-top: 12px; border-top: 1px solid var(--rule); }
+.note { color: var(--ink2); font-size: 13.5px; max-width: 78ch; }
+.steps { color: var(--ink); font-size: 14px; max-width: 65ch; padding-left: 22px; }
+.steps li { margin: 6px 0; }
+a { color: inherit; text-underline-offset: 3px; }
+:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+svg a:focus-visible { outline: none; }
+svg a:focus-visible .nodebox { stroke-width: 3; }
+.frame { overflow-x: auto; background: var(--panel); border: 1px solid var(--rule); }
+.frame > svg { display: block; width: 100%; height: auto; }
+.minw { min-width: 640px; }
+.minw9 { min-width: 900px; }
+.minw8 { min-width: 820px; }
+#vs-sentence { max-width: 78ch; margin: 12px 0; }
+.controls { display: flex; flex-wrap: wrap; gap: 10px 22px; align-items: center; padding: 10px 12px; background: var(--panel); border: 1px solid var(--rule); }
+.controls fieldset { border: 0; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; min-width: 0; }
+.controls [hidden] { display: none; }
+.controls legend, .controls .lab { font-size: 12px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink2); float: left; margin-right: 8px; padding: 0; }
+select, button { font: inherit; color: var(--ink); background: var(--bg); border: 1px solid var(--rule); padding: 4px 8px; min-height: 30px; }
+select { font-family: var(--mono); font-size: 13px; }
+.chip, .seg { display: inline-flex; align-items: center; gap: 6px; padding: 3px 9px; border: 1px solid var(--rule); background: var(--bg); cursor: pointer; font-size: 13px; min-height: 30px; }
+.chip input, .seg input { position: absolute; opacity: 0; pointer-events: none; }
+.chip:has(input:checked), .seg:has(input:checked) { background: var(--ink); color: var(--bg); border-color: var(--ink); }
+.chip:has(input:focus-visible), .seg:has(input:focus-visible) { outline: 2px solid var(--ink); outline-offset: 2px; }
+.chip svg { width: 12px; height: 12px; flex: none; }
+.chip:has(input:checked) svg path { stroke: var(--bg); }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 16px; font-size: 13px; color: var(--ink2); }
+.legend span { display: inline-flex; gap: 6px; align-items: center; }
+.legend svg { width: 14px; height: 14px; }
+details.tv summary { cursor: pointer; font-size: 13px; color: var(--ink2); padding: 4px 0; width: fit-content; }
+.tablewrap { overflow-x: auto; border: 1px solid var(--rule); background: var(--panel); max-height: 520px; overflow-y: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 13px; font-variant-numeric: tabular-nums; }
+th, td { padding: 5px 10px; text-align: right; white-space: nowrap; border-bottom: 1px solid var(--grid); }
+th:first-child, td:first-child, td.l, th.l { text-align: left; }
+thead th { position: sticky; top: 0; background: var(--panel); font-weight: 500; z-index: 1; border-bottom: 1px solid var(--rule); }
+thead th button { all: unset; cursor: pointer; padding: 2px 0; }
+thead th button:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+tbody tr:hover { background: var(--hover); }
+td.mk svg { width: 12px; height: 12px; vertical-align: -1px; margin-right: 6px; }
+.stagehead { display: flex; align-items: center; gap: 10px; margin-top: 18px; }
+.stagehead svg { width: 16px; height: 16px; }
+.cards { display: grid; gap: 0; }
+.card { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); gap: 8px 32px; padding: 20px 0 22px; border-top: 2px solid var(--stage, var(--rule)); scroll-margin-top: 16px; }
+.card:target { background: var(--hover); }
+.card > * { min-width: 0; }
+.card header { grid-column: 1 / -1; display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 14px; border: 0; padding: 0; }
+.card header .cls { font-size: 17px; font-weight: 600; }
+.card header .stp { font-size: 12.5px; color: var(--ink2); font-family: var(--mono); }
+.card p { margin-bottom: 8px; }
+dl.spec { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 6px 14px; margin: 0; font-size: 13.5px; }
+dl.spec dt { color: var(--ink2); font-size: 12px; letter-spacing: 0.05em; text-transform: uppercase; padding-top: 2px; }
+dl.spec dd { margin: 0; }
+.chips { display: flex; flex-wrap: wrap; gap: 5px; }
+.hw { font-family: var(--mono); font-size: 12px; border: 1px solid var(--rule); padding: 1px 7px; background: var(--panel); }
+.mini { grid-column: 1 / -1; overflow-x: auto; }
+.mini table { width: auto; min-width: 100%; }
+.mini th { font-weight: 500; color: var(--ink2); background: none; position: static; }
+.mini .none { color: var(--ink2); font-size: 13px; }
+.tip { position: fixed; z-index: 50; pointer-events: none; background: var(--ink); color: var(--bg); padding: 8px 10px; font-size: 12.5px; line-height: 1.4; max-width: 280px; font-variant-numeric: tabular-nums; display: none; }
+.tip b { font-weight: 600; }
+.tip .r { display: flex; justify-content: space-between; gap: 14px; font-family: var(--mono); font-size: 12px; }
+.panels { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; }
+.panel { min-width: 0; display: grid; gap: 6px; }
+.panel h3 { font-size: 14px; display: flex; gap: 8px; align-items: center; }
+.panel h3 svg { width: 14px; height: 14px; }
+.steps { display: grid; gap: 18px; }
+.method dl.spec { grid-template-columns: max-content minmax(0, 1fr); }
+pre { margin: 0; padding: 12px 14px; background: var(--panel); border: 1px solid var(--rule); overflow-x: auto; font-family: var(--mono); font-size: 13px; }
+.empty { padding: 28px 16px; color: var(--ink2); }
+.gridline { stroke: var(--grid); stroke-width: 1; fill: none; }
+.axisline { stroke: var(--ink2); stroke-width: 1; fill: none; }
+.tick { fill: var(--ink2); font-family: var(--mono); font-size: 11px; }
+.axlab { fill: var(--ink2); font-size: 12px; font-family: var(--font); }
+.roof { stroke: var(--ink); stroke-width: 1.5; fill: none; }
+.anchorline { stroke: var(--ink2); stroke-width: 1.25; stroke-dasharray: 6 4; fill: none; }
+.rooflab { fill: var(--ink); font-family: var(--mono); font-size: 11px; }
+.ptlab { fill: var(--ink); font-family: var(--mono); font-size: 10.5px; }
+.nodebox { fill: var(--node); stroke-width: 2; }
+.nodetxt { fill: var(--ink); font-family: var(--font); font-size: 13px; font-weight: 500; }
+.nodesub { fill: var(--ink2); font-family: var(--font); font-size: 12px; }
+.arrow { stroke: var(--ink2); stroke-width: 1.4; fill: none; }
+.arrowhead { fill: var(--ink2); }
+.minw11 { min-width: 1100px; }
+.edgelab { fill: var(--ink2); font-family: var(--font); font-size: 12px; paint-order: stroke; stroke: var(--panel); stroke-width: 4px; stroke-linejoin: round; }
+.condlab { fill: var(--ink); font-family: var(--font); font-size: 12.5px; font-weight: 500; paint-order: stroke; stroke: var(--panel); stroke-width: 4px; stroke-linejoin: round; }
+.tag { fill: var(--ink2); font-family: var(--font); font-size: 12.5px; }
+.nodetime { fill: var(--ink); font-family: var(--mono); font-size: 12px; }
+.chipbox { fill: var(--node); stroke-width: 1.5; }
+.chiptxt { fill: var(--ink); font-family: var(--font); font-size: 12.5px; }
+.container { fill: none; stroke: var(--ink2); stroke-width: 1; stroke-dasharray: 2 4; opacity: 0.8; }
+.contlab { fill: var(--ink2); font-family: var(--font); font-size: 12.5px; font-weight: 600; }
+.stagename { fill: var(--ink); font-family: var(--font); font-size: 13px; font-weight: 600; }
+.cnt { fill: var(--ink); font-family: var(--mono); font-size: 12.5px; }
+.funbar { fill: var(--ink2); }
+.funext { fill: var(--hover); stroke: var(--ink2); stroke-width: 1; stroke-dasharray: 3 2; }
+.box3 { border: 1px solid var(--rule); background: var(--panel); padding: 12px 14px; align-content: start; }
+.box3 p { font-size: 14px; }
+.kchip { display: inline-flex; align-items: center; gap: 6px; padding: 2px 8px; border: 1.5px solid var(--rule); background: var(--node); font-size: 12.5px; text-decoration: none; min-height: 24px; }
+.kchip:hover { background: var(--hover); }
+.kchip svg { width: 12px; height: 12px; }
+.chiprow { display: flex; flex-wrap: wrap; gap: 6px; }
+.keylist { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 10px 22px; margin: 0; padding: 12px 14px; list-style: none; background: var(--panel); border: 1px solid var(--rule); font-size: 13.5px; }
+.keylist li { display: grid; grid-template-columns: 76px minmax(0, 1fr); gap: 12px; align-items: center; }
+.keylist svg { width: 76px; height: 34px; }
+.barrow { display: grid; gap: 6px; padding: 12px 0; border-top: 1px solid var(--grid); }
+.barhead { display: flex; flex-wrap: wrap; gap: 2px 14px; align-items: baseline; }
+.barhead b { font-size: 14.5px; }
+.barhead span { color: var(--ink2); font-size: 13px; }
+.bar { display: flex; height: 30px; border: 1px solid var(--rule); background: var(--bg); }
+.bar > div { min-width: 3px; border-right: 1px solid var(--panel); }
+.bar > div:last-child { border-right: 0; }
+.barkey { display: flex; flex-wrap: wrap; gap: 4px 18px; margin: 0; padding: 0; list-style: none; font-size: 13px; }
+.barkey li { display: inline-flex; gap: 6px; align-items: center; }
+.barkey i { display: inline-block; width: 14px; height: 14px; border: 1px solid var(--rule); }
+.barkey .v { font-family: var(--mono); font-size: 12px; color: var(--ink2); }
+.takeaways { margin: 4px 0 0; padding-left: 20px; display: grid; gap: 6px; max-width: 78ch; }
+@media (max-width: 820px) {
+  .card { grid-template-columns: minmax(0, 1fr); }
+  section { margin-top: 40px; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}
+</style>
+
+<div class="wrap">
+  <header>
+    <div class="eyebrow">lsa / LSA indexer kernels</div>
+    <h1>CuTeDSL Kernel Roofline</h1>
+    <p class="lede">The read that picks which keys each query attends to, as lsa's LSA indexer runs it on one <span id="lede-gpu">GPU</span>: every kernel written in CuTeDSL, profiled with Nsight Compute at the shapes a served chunk sees, with the Triton version of each step profiled beside it.</p>
+    <ul class="facts" id="facts"></ul>
+  </header>
+
+  <section id="overview">
+    <h2>Overview</h2>
+    <p>A query cannot read all T keys of the context (10,485,760 at 10M tokens), so LSA's indexer picks which keys each query attends to. It emits nothing but a list of key indices - attention itself is unchanged and not on this page. Keys are clustered into buckets by Ward clustering: pools of 4 consecutive keys, merged 64 buckets to a closed 512-key cluster block, about 8 keys a bucket. A query scores bucket centroids instead of keys, picks its best p buckets (top-p, 1,024 at the served shape), and reads their keys, at most k of them (top-k, 4,096), plus the window of 512 recent keys and the 4 sink keys. N is the number of buckets, T / 8. One selection serves every head.</p>
+    <h3>From every key to a short list</h3>
+    <div class="controls" id="funnel-controls">
+      <fieldset><legend>Design</legend>
+        <label class="seg"><input type="radio" name="funnel-design" value="flat"> flat</label>
+        <label class="seg"><input type="radio" name="funnel-design" value="fixed"> fixed</label>
+        <label class="seg"><input type="radio" name="funnel-design" value="tree"> tree</label>
+      </fieldset>
+      <fieldset><legend>Phase</legend>
+        <label class="seg"><input type="radio" name="funnel-phase" value="prefill"> prefill</label>
+        <label class="seg"><input type="radio" name="funnel-phase" value="decode"> decode</label>
+      </fieldset>
+      <fieldset id="funnel-read" hidden><legend>Decode read</legend>
+        <label class="seg"><input type="radio" name="funnel-read" value="flat"> flat</label>
+        <label class="seg"><input type="radio" name="funnel-read" value="descend"> descend</label>
+      </fieldset>
+      <div class="lab-group"><span class="lab">Context</span> <select id="funnel-context" aria-label="Funnel context"></select></div>
+    </div>
+    <p class="note" id="funnel-note"></p>
+    <div class="frame"><svg id="funnel" role="img" aria-label="Funnel from every key to a selection of 4,612 indices, with the kernels of each step" class="minw11"></svg></div>
+    <h3>What each step means</h3>
+    <ol class="steps" id="funnel-meaning"></ol>
+    <h3>Two jobs every chunk and every decode step does</h3>
+    <div class="panels">
+      <div class="panel box3"><h3>Maintain the index (growth)</h3>
+        <p>When a 512-key block closes, its pools go through Ward clustering into 64 buckets. For fixed and tree, at a page end the hierarchy grows: node-bucket clustering groups buckets into node buckets of 4. A chunk or a step that closes nothing skips this job.</p>
+        <div class="chiprow" data-chips="ward,pairing"></div></div>
+      <div class="panel box3"><h3>Read the index (per query)</h3>
+        <p>Estimate a threshold, scan the buckets for those above it, score the candidates, pick the top-p and expand them to keys, then add the window and the sink. Every query does this, in prefill and in decode.</p>
+        <div class="chiprow" data-chips="samplepass,threshold,listing,listed,fill"></div></div>
+    </div>
+    <h3>Three designs</h3>
+    <div class="panels">
+      <div class="panel box3"><h3>Flat</h3>
+        <p>Scores every visible bucket, N of them, with one fused scan. The cost is linear in the context.</p>
+        <div class="chiprow" data-chips="samplepass,threshold,listing,listed,fill,shortlisting"></div></div>
+      <div class="panel box3"><h3>Fixed</h3>
+        <p>Groups buckets into node buckets of 4, one level above them. A query keeps a beam of 2,048 node buckets and scores only their children, 2,048 x 4 = 8,192, instead of every bucket. Level 0 picks the buckets.</p>
+        <div class="chiprow" data-chips="beam,pick,pairing"></div></div>
+      <div class="panel box3"><h3>Tree</h3>
+        <p>The same node buckets of 4, with levels that keep growing with the context. The beam starts at the lowest level of at most 32,768 node buckets, keeps 2,048 per level on the way down, and level 0 picks the buckets.</p>
+        <div class="chiprow" data-chips="widekeep,beam,pick,pairing"></div></div>
+    </div>
+    <p class="note">Only the fixed and tree reads use the start-level keep, the beam step, the top-p pick and node-bucket clustering. Decode reads flat by default, and fixed or tree can descend instead.</p>
+    <h3>Where the time goes at <span id="ov-ctx"></span></h3>
+    <p class="note">Summed CuTeDSL kernel time from the Nsight Compute profile. Each bar is scaled to its own total, so compare the shares, not the lengths. Torch launches of a few microseconds are left out.</p>
+    <div id="bars"></div>
+    <ul class="takeaways" id="takeaways"></ul>
+
+    <section id="versus">
+      <h2>CuTeDSL against Triton</h2>
+      <p class="note">One dot pair per step: the filled dot is CuTeDSL, the hollow dot is Triton, on a log time axis. The ratio is Triton over CuTeDSL, so above 1 CuTeDSL is faster. Rows run from the biggest win to the smallest. Kernel replay sums the step's own kernels in the Nsight Compute profile, torch launches left out. Wall time is the step's median from CUDA events in a pass with no profiler attached, torch launches included. The reference GEMM is a cuBLAS call in both languages, so it is a control that should read 1.00x.</p>
+      <div class="controls" id="vs-controls">
+        <div class="lab-group"><span class="lab">Context</span> <select id="vs-context" aria-label="Comparison context"></select></div>
+        <fieldset id="vs-mode"><legend>Time</legend>
+          <label class="seg"><input type="radio" name="vsmode" value="replay" checked> Kernel replay</label>
+          <label class="seg"><input type="radio" name="vsmode" value="wall"> Wall time</label>
+        </fieldset>
+      </div>
+      <p id="vs-sentence"></p>
+      <div class="legend" id="vs-legend"></div>
+      <div class="frame"><svg id="vs-svg" role="img" aria-label="Per step time of CuTeDSL against Triton, with their ratio" class="minw8"></svg></div>
+      <details class="tv"><summary>Table view of the comparison</summary><div class="tablewrap" id="vs-table"></div></details>
+    </section>
+
+    <section id="compare" hidden>
+      <h2>Against <span class="cmp-other">the other GPU</span></h2>
+      <p class="note">Each step's median wall time on this GPU beside the same step on <span class="cmp-other">the other GPU</span>, in the same language, on the same synthetic inputs at the same context. The filled dot is this GPU, the hollow dot the other, on a log time axis. The ratio is the other GPU's time over this one's, so above 1 this GPU is faster. A step whose shapes do not follow the context is compared at the one context it ran at.</p>
+      <div class="controls" id="cmp-controls">
+        <div class="lab-group"><span class="lab">Context</span> <select id="cmp-context" aria-label="Comparison context"></select></div>
+        <fieldset id="cmp-kernels"><legend>Kernels</legend>
+          <label class="seg"><input type="radio" name="cmpkernels" value="cutedsl" checked> kernels: cutedsl</label>
+          <label class="seg"><input type="radio" name="cmpkernels" value="triton"> kernels: triton</label>
+        </fieldset>
+      </div>
+      <p id="cmp-sentence"></p>
+      <div class="frame"><svg id="cmp-svg" role="img" aria-label="Per step time on this GPU against the other GPU, with their ratio" class="minw8"></svg></div>
+      <details class="tv"><summary>Table view of the comparison</summary><div class="tablewrap" id="cmp-table"></div></details>
+    </section>
+
+    <h3>This profile</h3>
+    <p class="note" id="run-note"></p>
+  </section>
+
+  <section id="pipeline">
+    <h2>The read, end to end</h2>
+    <p class="note">Two flowcharts, one for a prefill chunk and one for a decode step. Both start by maintaining the index, then read it. Follow the arrows from the top.</p>
+    <h3>How to read these</h3>
+    <ul class="keylist">
+      <li><svg viewBox="0 0 76 34" aria-hidden="true"><rect x="3" y="4" width="70" height="26" class="nodebox" style="stroke:var(--s0)"/><path d="M13,17m-4.5,0a4.5,4.5 0 1,0 9,0a4.5,4.5 0 1,0 -9,0" style="fill:var(--s0)"/><text x="23" y="21" class="nodetime">3.2 ms</text></svg><span>A CuTeDSL kernel. Its border and shape give its stage. Select it to jump to its card. The time is its measured duration at <span class="maxctx"></span>, or marked with an @ context where it only ran at a smaller one.</span></li>
+      <li><svg viewBox="0 0 76 34" aria-hidden="true"><rect x="3" y="4" width="70" height="26" class="nodebox" style="stroke:var(--torch);stroke-dasharray:4 3;stroke-width:1.5"/><text x="12" y="22" class="nodesub" style="fill:var(--torch)">torch.mm</text></svg><span>A torch operation. It is not a CuTeDSL kernel.</span></li>
+      <li><svg viewBox="0 0 76 34" aria-hidden="true"><path d="M38,3L72,17L38,31L4,17Z" class="nodebox" style="stroke:var(--ink2);stroke-width:1.5"/><text x="38" y="21" text-anchor="middle" class="nodesub">?</text></svg><span>A decision. Each exit is labeled with the answer and is taken only for that answer.</span></li>
+      <li><svg viewBox="0 0 76 34" aria-hidden="true"><path d="M4,17H68" class="arrow"/><path d="M72,17L64,13V21Z" class="arrowhead"/></svg><span>A solid arrow is always taken. Its label is what flows along it, with the shape. R is the 32,768 queries of a chunk, N the visible buckets, p the top-p of 1,024, B the requests of a decode step.</span></li>
+      <li><svg viewBox="0 0 76 34" aria-hidden="true"><path d="M4,17H68" class="arrow" stroke-dasharray="6 4"/><path d="M72,17L64,13V21Z" class="arrowhead"/></svg><span>A dashed arrow is taken only under the condition printed on it.</span></li>
+      <li><svg viewBox="0 0 76 34" aria-hidden="true"><rect x="3" y="4" width="40" height="26" class="nodebox" style="stroke:var(--s2)"/><path d="M43,12H62V24H48" class="arrow" stroke-dasharray="6 4"/><path d="M44,24L51,20V28Z" class="arrowhead"/></svg><span>A loop arrow: the box repeats, here once per level of the tree.</span></li>
+      <li><svg viewBox="0 0 76 34" aria-hidden="true"><rect x="2" y="3" width="72" height="28" class="container"/><text x="38" y="22" text-anchor="middle" class="nodetime">H</text></svg><span>A dotted frame groups steps that share a setting, such as the CUDA graph. A letter on a kernel says where its CuTeDSL kernel runs: H on Hopper only, B on Blackwell only, T in Triton on this GPU, which has no CuTeDSL kernel for the step.</span></li>
+    </ul>
+    <div class="legend" id="stage-legend"></div>
+    <h3>Prefill chunk</h3>
+    <p class="note">One chunk is R = 32,768 queries. N is the number of visible buckets.</p>
+    <div class="frame"><svg id="flow-prefill" role="img" aria-label="Flowchart of a prefill chunk: maintain the index, then read it by the flat, short or tree path" class="minw11"></svg></div>
+    <h3>Decode step</h3>
+    <p class="note">The flat read runs inside the CUDA graph. Growth runs eagerly before the forward, when a block closes or a page end grows the tree. The descend read, for fixed and tree, is eager. Expansion (by threshold) and the descend kernels are not profiled at decode, so their boxes carry no time.</p>
+    <div class="frame"><svg id="flow-decode" role="img" aria-label="Flowchart of a decode step: maintain the index, then read it flat inside the CUDA graph or by descending eagerly" class="minw11"></svg></div>
+  </section>
+
+  <section id="cards">
+    <h2>Kernel cards</h2>
+    <p class="note">Costs are evaluated at the served shapes: R = 32,768 queries, N = T / 8 = 1.31M buckets at 10M tokens, index dim d = 64, top-p p = 1,024, top-k k = 4,096. The measured rows come from the profile, one column per context.</p>
+    <div class="cards" id="cards-body"></div>
+  </section>
+
+  <section id="roofline">
+    <h2>The roofline</h2>
+    <p class="note">Each point is one kernel launch at one context. Intensity is FLOPs per byte moved at DRAM, or at L2. Height is achieved FLOP/s. A point near a roof is limited by it.</p>
+    <p class="note" id="rf-triton-note">Filled markers are CuTeDSL launches. A hollow marker of the same shape is the Triton version of that step at that context: its launches summed, FLOPs and bytes over their time. A thin line joins it to the nearest CuTeDSL point of the same step and context.</p>
+    <div class="controls" id="controls">
+      <div class="lab-group"><span class="lab">Context</span> <select id="f-context" aria-label="Context filter"></select></div>
+      <fieldset id="f-stage"><legend>Stage</legend></fieldset>
+      <fieldset id="f-kernels"><legend>Triton</legend>
+        <label class="chip" for="f-triton"><input type="checkbox" id="f-triton" checked> Show Triton</label>
+      </fieldset>
+      <fieldset id="f-axis"><legend>Intensity at</legend>
+        <label class="seg"><input type="radio" name="axis" value="dram" checked> DRAM</label>
+        <label class="seg"><input type="radio" name="axis" value="l2"> L2</label>
+      </fieldset>
+    </div>
+    <div class="frame"><svg id="rf-svg" role="img" aria-label="Roofline of CuTeDSL kernels, log intensity against log FLOP per second" class="minw"></svg></div>
+    <p class="note" id="rf-note"></p>
+    <details class="tv"><summary>Table view of the plotted points</summary><div class="tablewrap" id="rf-table"></div></details>
+  </section>
+
+  <section id="sol">
+    <h2>Speed of light</h2>
+    <p class="note">Each point is a kernel launch: memory throughput on the x axis, SM throughput on the y axis, both as a percent of the hardware peak. A point high on either axis is limited by that side. A point near the origin is limited by latency or by waiting, not by throughput. This chart includes the integer and selection kernels the roofline cannot place, and follows the filters above. Hollow markers are the Triton version of a step, joined to the nearest CuTeDSL point of the same step and context, with SM and memory throughput weighted by launch time.</p>
+    <div class="legend" id="sol-legend"></div>
+    <div class="frame"><svg id="sol-svg" role="img" aria-label="SM throughput against memory throughput for each kernel" class="minw"></svg></div>
+    <details class="tv"><summary>Table view of the plotted points</summary><div class="tablewrap" id="sol-table"></div></details>
+  </section>
+
+  <section id="time">
+    <h2>Time against context</h2>
+    <p class="note">Median wall time of one call from CUDA events at boost clocks, one panel per stage. Steps whose shapes are one chunk's regardless of context are flat. The durations in the tables above are single Nsight Compute replays, which run slower than these.</p>
+    <div class="panels" id="time-panels"></div>
+    <details class="tv"><summary>Table view of the medians</summary><div class="tablewrap" id="time-table"></div></details>
+  </section>
+
+  <section id="table">
+    <h2>All kernel records</h2>
+    <p class="note">Every profiled launch of both languages, including torch and cuBLAS kernels. The Kernels column says which language a launch belongs to. Select a column header to sort.</p>
+    <div class="controls" id="kernels-controls">
+      <div class="lab-group"><span class="lab">Kernels</span> <select id="f-kernels-table" aria-label="Kernels filter"><option value="all">Both languages</option><option value="cutedsl">cutedsl</option><option value="triton">triton</option></select></div>
+    </div>
+    <div class="tablewrap" id="all-table"></div>
+  </section>
+
+  <section id="method" class="method">
+    <h2>Method</h2>
+    <dl class="spec">
+      <dt>Profiler</dt><dd>Nsight Compute, <code>--set full</code>, <code>--clock-control none</code> so the GPU runs at its boost clock, cache flushed between passes. Each kernel is one replay, so durations are single samples.</dd>
+      <dt>Languages</dt><dd>Both languages are profiled on identical inputs. Triton goes through the same front doors with <code>kernels="triton"</code>, so a step's inputs, shapes and contexts match, and only the kernels behind the door differ.</dd>
+      <dt>Inputs</dt><dd>Synthetic, built at the served shapes: a 32,768-query chunk, index dim 64, top-p 1,024, top-k 4,096, window 512, sink 4, buckets of 8 keys, 64 buckets a 512-key page, beam 2,048 of node buckets of 4, 32,768 start nodes.</dd>
+      <dt>Counters</dt><dd>FLOPs come from the FP32 instruction counters and the tensor-pipe operation counters. Bytes come from the DRAM, L2 and L1 traffic counters. Intensity is FLOPs over bytes at that level.</dd>
+      <dt>Roofs</dt><dd id="roofs-text">H200 specification: 989.4 TFLOP/s bf16 tensor, 494.7 TFLOP/s tf32 tensor, 66.9 TFLOP/s FP32, 4.8 TB/s HBM. Dashed lines are what a copy and a cuBLAS bf16 GEMM measured on this machine.</dd>
+      <dt>Reproduce</dt><dd><pre>lsa kernels roofline --output DIR
+python -m lsa.evaluation.performance.roofline.page DIR/roofline.json DIR/roofline.html</pre></dd>
+    </dl>
+  </section>
+</div>
+<div class="tip" id="tip" role="tooltip"></div>
+<script id="roofline-data" type="application/json">{{ROOFLINE_JSON}}</script>
+<script id="compare-data" type="application/json">{{COMPARE_JSON}}</script>
+<script>
+(function () {
+"use strict";
+
+/* ---------- data ---------- */
+var RAW = {};
+try { RAW = JSON.parse(document.getElementById("roofline-data").textContent) || {}; } catch (e) { RAW = {}; }
+
+var STAGES = [
+  { id: "prefill scan", label: "Prefill scan", shape: "circle" },
+  { id: "expansion", label: "Expansion", shape: "square" },
+  { id: "tree", label: "Tree", shape: "diamond" },
+  { id: "decode", label: "Decode", shape: "triangle" },
+  { id: "growth", label: "Growth", shape: "triangleDown" },
+  { id: "anchor", label: "cuBLAS bf16 GEMM", shape: "cross" }
+];
+var STAGE_INDEX = {};
+STAGES.forEach(function (s, i) { STAGE_INDEX[s.id] = i; });
+// One display name for each step the data names and each node, so every place shows the same label
+var STEP_DISPLAY = {
+  "threshold estimate": "Threshold estimate", "bucket scan": "Bucket scan", "candidate scoring": "Candidate scoring",
+  "dense scoring": "Dense scoring (fallback)", "short-context listing": "Short-context listing", "expansion by threshold": "Expansion (by threshold)",
+  "expansion in rank order": "Expansion (in rank order)", "start-level keep": "Start-level keep", "beam step": "Beam step", "top-p pick": "Top-p pick",
+  "decode select": "Decode select", "ward clustering": "Ward clustering", "node-bucket clustering": "Node-bucket clustering"
+};
+function stepName(step) { return STEP_DISPLAY[step] || step; }
+var STAGE_OF = {
+  "threshold estimate": "prefill scan", "bucket scan": "prefill scan", "candidate scoring": "prefill scan",
+  "dense scoring": "prefill scan", "short-context listing": "prefill scan", "expansion by threshold": "expansion",
+  "expansion in rank order": "expansion", "start-level keep": "tree", "beam step": "tree", "top-p pick": "tree",
+  "decode select": "decode", "ward clustering": "growth", "node-bucket clustering": "growth", "reference gemm": "anchor"
+};
+
+var CARDS = [
+  { id: "samplepass", stage: "prefill scan", cls: "SamplePass", short: "Threshold estimate", steps: [{ step: "threshold estimate", match: ["samplepass"] }],
+    does: "Scores every 24th bucket (s = round(1.5p / 64) = 24, so S = N / 24 samples) against 128 index queries at a time, keeping the scores on chip. The sums pass adds each row's sample scores for their mean and keeps its best score and 64 group maxima. The histogram pass bins the samples into 64 bins between the mean and the best, to estimate each row's score at about 1.5 times top-p. Two compiled passes.",
+    io: "index queries [R, 64] bf16, bucket centroids [N, 64] bf16, visible counts [R] int32 -> per-row sums, best scores, group maxima, histograms",
+    launch: "Grid (ceil(R / 128), blocks x parts), 256 threads, shared memory 16 KB queries + 2-stage 16 KB tile (+ 32 KB histogram)",
+    hw: ["mma.sync m16n8k16 bf16 -> fp32", "ldmatrix", "cp.async 2-stage", "butterfly shuffles", "vote_any", "shared atomics", "global atomic add", "global atomic fmax"],
+    cost: ["FLOPs per pass: 2 R S d = 2 x 32,768 x 54,613 x 64 = 0.23 TFLOP", "Unique HBM: about S x 128 B + R x 128 B = 11 MB", "L2 traffic: about (R / 128) S x 128 B = 1.8 GB"],
+    bound: "Issue and the binning epilogue, not bytes. Warp mma.sync, not WGMMA." },
+  { id: "threshold", stage: "prefill scan", cls: "Threshold", short: "Threshold", steps: [{ step: "threshold estimate", match: ["threshold"] }],
+    does: "For each row, finds the lower edge of the top bin that reaches the row's rank, minus a slack of norm x 2^-14, and resets the workspace for the next chunk. One thread per row.",
+    io: "histograms [R, 64] -> thresholds [R] fp32",
+    launch: "Grid ceil(R / 128) x 128 threads",
+    hw: ["one thread per row"],
+    cost: ["FLOPs: none", "Bytes: about R x 64 bins x 4 B = 8 MB"],
+    bound: "Latency. It is too small to fill the GPU." },
+  { id: "listing", stage: "prefill scan", cls: "BucketScan", short: "Bucket scan", hopper: true, steps: [{ step: "bucket scan", match: ["bucketscan", "listing"] }],
+    does: "The fused scan. It scores every visible bucket against 128 queries on the tensor cores, keeps the buckets at or above the row's threshold minus 1e-4 x |q|, compacts them per row in shared memory and reserves their place with one global atomic per row.",
+    io: "index queries [R, 64] bf16, bucket centroids [N, 64] bf16, thresholds [R] -> buckets [R, 3p] int32, kept counts [R] int32",
+    launch: "Grid (ceil(R / 128), ceil(ceil(N / 64) / span_tiles)), 128 threads (one warpgroup), shared memory 16 KB queries + 2 x 64x64 bf16 centroid stages + 16 KB per-row lists",
+    hw: ["WGMMA 64x32x16 bf16", "smem operands", "ping-pong accumulators", "cp.async 2-stage", "PTX shf bitmasks + clz", "shared atomics", "relaxed global atomics"],
+    cost: ["FLOPs: 2 R N d = 2 x 32,768 x 1.31M x 64 = 5.5 TFLOP", "Unique HBM: about N x 128 B = 168 MB", "L2 traffic: about R x N bytes"],
+    bound: "Tensor-core issue plus the epilogue.",
+    blackwell: { cls: "SurvivorListing (Blackwell)",
+      does: "The fused scan on Blackwell's tensor cores. A TMA warp streams 128-bucket tiles of centroids, an MMA warp scores each tile against 128 queries into one of four tensor-memory accumulators, and two groups of four warps take the accumulators in turn. A tester thread reads its own row's tensor-memory lane, so it holds one row's scores, threshold and visible count. It tests each chunk of 32 scores by their maximum and builds the survivor bitmask only when the maximum reaches the threshold. A row's list in shared memory is its thread's alone, and a full list moves to the global listing with one atomic.",
+      launch: "Grid (ceil(R / 128), ceil(ceil(N / 128) / span_tiles)), 320 threads: 8 tester warps in 2 groups, 1 MMA warp, 1 TMA warp. One CTA an SM: 16 KB queries + 4 x 16 KB centroid stages + 32 KB row lists, 512 tensor-memory columns",
+      hw: ["tcgen05.mma 128x128x16 bf16 -> TMEM", "TMA bulk tensor loads", "mbarrier pipelines", "tcgen05.ld 32x32b.x32", "FMNMX3", "sub.f32x2", "PTX shf bitmasks + clz", "relaxed global atomics"],
+      bound: "Tensor-core issue plus the survivor epilogue.",
+      context: "On Hopper the same step runs the warpgroup-MMA kernel of this card's H200 profile." },
+    context: "The Triton version listed at 6.1 ms per 8k-query chunk at 10M against a 2.67 ms bare core. The shared-memory compaction Triton cannot express is why this kernel exists." },
+  { id: "listed", stage: "prefill scan", cls: "CandidateScoring", short: "Candidate scoring", steps: [{ step: "candidate scoring", match: ["candidatescoring", "scoring"] }],
+    does: "Scores each listed bucket and packs an int64 key: the order-preserving score bits high, the reversed bucket low. Also counts the buckets at or above the threshold. Runs with dense = False.",
+    io: "index queries, bucket centroids, buckets [R, 3p] int32 -> keys [R, 3p] int64, counts [R]",
+    launch: "Grid (R, 1), 128 threads = 16 groups of 8 lanes, 8 loads in flight each",
+    hw: ["butterfly shuffles", "shared atomic", "gathered loads"],
+    cost: ["FLOPs: 2 d x 3p per row = 2 x 64 x 3,072 x 32,768 = 13 GFLOP", "Gathered bytes: R x 3p x 128 B = 12.9 GB, mostly from L2", "About 1 FLOP per byte"],
+    bound: "Gather. No tensor cores." },
+  { id: "dense", stage: "prefill scan", cls: "CandidateScoring (dense)", short: "Dense scoring (fallback)", steps: [{ step: "dense scoring", match: ["candidatescoring", "scoring"] }],
+    does: "The same kernel with dense = True. It scores every visible bucket at its own column for rows whose bucket scan may miss, 256 rows at a time, then torch takes the top-k.",
+    io: "index queries [256, 64], bucket centroids [N, 64] -> scores [256, N]",
+    launch: "256 rows per call, same geometry as candidate scoring",
+    hw: ["butterfly shuffles", "shared atomic"],
+    cost: ["FLOPs per row: 2 d N = 0.17 GFLOP", "Bytes per call: N x 128 B = 168 MB centroids (shared by the 256 rows through L2) + 256 x N x 4 B of scores"],
+    bound: "Memory." },
+  { id: "shortlisting", stage: "prefill scan", cls: "RowListing", short: "Short-context listing", steps: [{ step: "short-context listing", match: ["rowlisting", "listing"] }, { step: "start-level keep", first: true }],
+    does: "For N below 32,768. After torch.mm, it samples each row at stride s and searches the threshold by a 2-digit radix search. One streaming pass lists the columns at or above it, and a block-wide scan places them (in column order when ordered). Short or overflowed rows are listed exactly by a 4-pass radix plus a tie pass.",
+    io: "scores [R, N] fp32 -> buckets [R, 3p] int32 (column order when ordered)",
+    launch: "Grid R x 512 threads, 32 KB of sample words + 256 bins",
+    hw: ["shared atomics", "shuffle scans", "block-wide scan"],
+    cost: ["FLOPs: none", "Bytes: reads the score matrix, R x N x 4 B = 4.3 GB at N = 32,767"],
+    bound: "Memory. It reads the fp32 score matrix." },
+  { id: "fill", stage: "expansion", cls: "ExpansionByThreshold", short: "Expansion (by threshold)", steps: [{ step: "expansion by threshold", match: ["expansionbythreshold", "fill"] }],
+    does: "A radix search over the int64 keys, one byte per pass (4 high, 4 low only on ties), finds the last key whose buckets at or above it hold top-k members or number top-p buckets. It writes the members of every bucket above that key, then the cut bucket up to the room left, then window and sink.",
+    io: "keys [R, 3p] int64, bucket members -> read lists [R, k + n_w + n_sink] = 4,612 wide int32",
+    launch: "Grid R x 512 threads, keys in registers, 4 KB digit counts + 8 KB walk",
+    hw: ["shared atomics", "shuffle scans", "ballot / popc", "lane-group copies"],
+    cost: ["Writes: R x 4,612 x 4 B = 604 MB", "Reads: keys R x 3p x 8 B = 0.8 GB plus the members they point to"],
+    bound: "Memory and latency." },
+  { id: "inorder", stage: "expansion", cls: "ExpansionInRankOrder", short: "Expansion (in rank order)", steps: [{ step: "expansion in rank order", match: ["expansioninrankorder", "inorder"] }],
+    does: "Reads the picks best first. A scan places each pick's first entry, the picks that start before top-k copy their members, then window and sink are appended. A CTA-wide atomic_min decides where the walk stops.",
+    io: "picks, bucket members -> read lists [R, 4,612] int32",
+    launch: "Grid R x 512 threads",
+    hw: ["CTA atomic_min", "shuffle scans"],
+    cost: ["Writes: R x 4,612 x 4 B = 604 MB", "FLOPs: none"],
+    bound: "Memory." },
+  { id: "beam", stage: "tree", cls: "BeamStep", short: "Beam step", steps: [{ step: "beam step", match: ["beamstep", "beam"] }],
+    does: "Loads the open node buckets' scores into a per-query shared row, gathers and scores the carried children (fp8 node centroids times a scale of 16, or bf16), and finds the k-th greatest score word with a 4-pass byte radix. Rows 8 times the keep or wider sample 4,096 words, list at about 1.15 times keep and search only that. Writes the kept columns' children in column order.",
+    io: "index queries [S, 64], node centroids (fp8 or bf16), carried children -> kept children [S, keep x 4] int32",
+    launch: "One CTA per query, 256 or 512 threads, dynamic shared memory up to 227 KB",
+    hw: ["shared atomics", "ballot / popc / lanemask compaction", "shuffles", "fp8 gathers"],
+    cost: ["FLOPs: 2 d S C with C = beam 2,048 x 4 = 8,192 carried, = 1.05 MFLOP per query", "Gathered bytes: S x C x 64 B (fp8) = 17 GB per level at S = 32,768"],
+    bound: "Gather and latency." },
+  { id: "widekeep", stage: "tree", cls: "StartLevelKeep", short: "Start-level keep", steps: [{ step: "start-level keep", match: ["startlevelkeep", "kept"] }],
+    does: "For a start level wider than shared memory stages (more than about 28k columns, the tree's 32,768 start nodes). RowListing (ordered) lists the row first, then this kernel takes the exact top keep by a 4-pass radix, ties to the lowest column, and writes their children. Profiled under the start-level keep step together with the RowListing launch.",
+    io: "listing [R, 3p] int32, scores -> kept children [R, keep x 4] int32",
+    launch: "Grid R x 256 threads",
+    hw: ["shared atomics", "radix select", "shuffle scans"],
+    cost: ["FLOPs: none", "Bytes: R x 32,768 x 4 B = 4.3 GB of scores read"],
+    bound: "Memory." },
+  { id: "pick", stage: "tree", cls: "TopPPick", short: "Top-p pick", steps: [{ step: "top-p pick", match: ["toppick", "pick"] }],
+    does: "Level 0. Scores the last beam's child buckets (bf16 bucket centroids, gathered through pages) beside the uncovered buckets' scores, takes the exact top-p, and writes the int64 keys (score word plus reversed cache row) that the expansion reads.",
+    io: "index queries, last beam's children, uncovered scores -> keys [S, p] int64",
+    launch: "Grid S x 512 threads",
+    hw: ["paged gathers", "radix select", "shared atomics"],
+    cost: ["FLOPs: 2 d x (8,192 + uncovered) per query", "Gathered bytes: bucket centroids are 168 MB at 10M, over the 60 MB L2"],
+    bound: "Gather and memory." },
+  { id: "dsample", stage: "decode", cls: "decode.Sample", short: "Decode sample", steps: [{ step: "decode select", match: ["sample"] }],
+    does: "Scores n_s strided samples (runs of 8 neighbours) through the request's pages and writes order-preserving words.",
+    io: "index query [B, 64], bucket centroids through pages -> sample words [B, n_s]",
+    launch: "One request per CTA row",
+    hw: ["paged gathers", "order-preserving words"],
+    cost: ["FLOPs: 2 d n_s per request", "Bytes: n_s x 128 B"],
+    bound: "Latency." },
+  { id: "dthreshold", stage: "decode", cls: "decode.Threshold", short: "Decode threshold", steps: [{ step: "decode select", match: ["threshold"] }],
+    does: "A 3-pass radix over the sample for the score that about 1.5 p samples sit above, with its low 13 bits cleared.",
+    io: "sample words [B, n_s] -> threshold [B]",
+    launch: "B x 1,024 threads",
+    hw: ["radix passes", "shared atomics"],
+    cost: ["FLOPs: none", "Bytes: n_s x 4 B per request"],
+    bound: "Launch." },
+  { id: "dscan", stage: "decode", cls: "decode.Scan", short: "Decode scan", steps: [{ step: "decode select", match: ["scan"] }],
+    does: "Scores every bucket through the pages into scores [B, M] fp32, and stages each 256-bucket span's keys at or above the threshold in bucket order, with one global atomic per span.",
+    io: "index query [B, 64], bucket centroids through pages, threshold [B] -> scores [B, 
