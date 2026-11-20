@@ -1,0 +1,33 @@
+s one block"
+            )
+        return None
+    if served.pisa is not None:
+        enable_pisa(served.pisa)
+    elif served.design is not None:
+        enable_lsa(served.design)
+    elif served.debug.dumps:
+        enable_native_dump(served.debug.dump)
+    ENABLED.append(served)
+    return None
+
+
+def register() -> None:
+    """Carry the plugin's one standing hook, on the model config.
+
+    Called once per process by sglang's plugin loader, before any config exists.
+    Whether to enable is not known yet, and sglang applies a hook for good, so nothing a design needs is
+    registered here: `configure` runs after every model config is built, finds the block, and enables the process
+    then - which every process that runs a model does before it builds one.
+    A server with no block pays one attribute read per model config it builds.
+
+    Raises:
+        RuntimeError: The model config's constructor no longer resolves.
+    """
+    missing = unresolved((MODEL_CONFIG,))
+    if missing:
+        raise RuntimeError("lsa cannot read its settings from this sglang - " + "; ".join(missing))
+
+    from sglang.srt.plugins.hook_registry import HookRegistry, HookType
+
+    HookRegistry.register(MODEL_CONFIG, configure, HookType.AFTER)
+    logger.info("lsa: settings are read from the model config's %r block", Plugin.BLOCK)
