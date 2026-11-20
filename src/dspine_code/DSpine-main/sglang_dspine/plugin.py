@@ -1,0 +1,177 @@
+"""One plugin entry point for DSpine on SGLang 0.5.22."""
+
+from sglang_dspine.spec import (
+    ALGORITHM,
+    DSpineSpecAlgo,
+    handle_dspine_server_args,
+    is_dspine,
+    map_dspine_draft_architecture,
+    worker_factory,
+)
+
+HOOK_TARGETS = {
+    "handle_speculative_decoding": "sglang.srt.arg_groups.speculative_hook.handle_speculative_decoding",
+    "spec_need_hidden_states": "sglang.srt.speculative.spec_utils.spec_need_hidden_states",
+    "decode_cuda_graph_runner_cls": "sglang.srt.model_executor.model_runner.ModelRunner._decode_cuda_graph_runner_cls",
+    "config_draft_model": "sglang.srt.configs.model_config.ModelConfig._config_draft_model",
+    "dflash_sampling_verify": "sglang.srt.speculative.dflash_worker_v2.compute_dflash_sampling_correct_drafts_and_bonus",
+}
+_registered = False
+
+
+def after_handle_speculative_decoding(result, server_args, *args, **kwargs):
+    from sglang.srt.arg_groups.overrides import resolved_view
+
+    if is_dspine(resolved_view(server_args).speculative_algorithm or ""):
+        handle_dspine_server_args(server_args)
+    return result
+
+
+def around_spec_need_hidden_states(original, *args, **kwargs):
+    from sglang.srt.runtime_context import get_spec
+
+    if is_dspine(get_spec().speculative_algorithm or ""):
+        return False
+    return original(*args, **kwargs)
+
+
+def around_decode_cuda_graph_runner_cls(original, model_runner, *args, **kwargs):
+    if model_runner.is_draft_worker and is_dspine(model_runner.spec_algorithm):
+        # [PATCH] draft CUDA-graph capture stalls under the FlashInfer SWA path
+        # on SM120; run ONLY the draft eagerly and keep the target graphed.
+        import os
+        if os.environ.get("DSPINE_DRAFT_GRAPH", "off").lower() in ("off", "0", "false", "no"):
+            print("[PATCH] DSpine draft: eager (target graph kept)", flush=True)
+            return original(model_runner, *args, **kwargs)
+        from sglang_dspine.runtime.graph_runner import DSpineDraftCudaGraphRunner
+
+        return DSpineDraftCudaGraphRunner
+    return original(model_runner, *args, **kwargs)
+
+
+def around_config_draft_model(original, model_config, *args, **kwargs):
+    map_dspine_draft_architecture(model_config)
+    return original(model_config, *args, **kwargs)
+
+
+# [PATCH dspine-stable] count of rounds that had to fall back, for the log line below
+_DSPINE_FALLBACK_ROUNDS = [0]
+
+
+def around_dflash_sampling_verify(original, *args, **kwargs):
+    from sglang.srt.runtime_context import get_spec
+
+    if is_dspine(get_spec().speculative_algorithm or ""):
+        from sglang_dspine.runtime import worker as _dspine_worker
+        from sglang_dspine.runtime.worker import accept_dspine_sampled_round
+
+        # [PATCH dspine-stable] A round's sampled chain is produced by `sampler.sample(bs)`, and
+        # some draft paths do not reach it. DSpine raises there, which tears down the whole
+        # scheduler and takes every in-flight request with it. Fall back to the stock DFlash
+        # sampled verification for that round instead - valid tokens, service stays up.
+        holder = getattr(_dspine_worker, "_active_worker", None)
+        sampler = getattr(holder, "_dspine_sampler", None) if holder is not None else None
+        if sampler is not None and not getattr(sampler, "round_sampled", False):
+            _DSPINE_FALLBACK_ROUNDS[0] += 1
+            if _DSPINE_FALLBACK_ROUNDS[0] == 1:
+                print(
+                    "[PATCH dspine-stable] sampled round without its sampled draft chain - "
+                    "verifying with the stock DFlash sampler instead of raising",
+                    flush=True,
+                )
+            return original(*args, **kwargs)
+        return accept_dspine_sampled_round(*args, **kwargs)
+    return original(*args, **kwargs)
+
+
+def around_seeded_sampler(
+    original, sampler, probs, sampling_info, positions, simple_sampling_case
+):
+    from sglang.srt.runtime_context import get_spec
+
+    if (
+        is_dspine(get_spec().speculative_algorithm or "")
+        and sampling_info.sampling_seed is not None
+    ):
+        from sglang_dspine.sampling.random import sample_prefill
+
+        return sample_prefill(probs, sampling_info, positions)
+    return original(sampler, probs, sampling_info, positions, simple_sampling_case)
+
+
+def register():
+    global _registered
+    if _registered:
+        return
+    from sglang.srt.models.registry import ModelRegistry
+    from sglang.srt.plugins.hook_registry import HookRegistry, HookType
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+    from sglang.srt.speculative.spec_registry import get_spec as registered_spec
+
+    from sglang_dspine.layers import head
+    from sglang_dspine.layers.gdn import register_ragged_gdn_hooks
+    from sglang_dspine.layers.layout import register_bf16_layout_hook
+    from sglang_dspine.runtime.replayssm import hooks as replay
+    from sglang_dspine.verification.caps import register_verify_cap_hooks
+    from sglang_dspine.verification.mrope import around_spec_mrope_positions
+
+    if "DSpineDraftModel" not in ModelRegistry.models:
+        ModelRegistry.register("sglang_dspine.models", strict=True)
+    hooks = (
+        (
+            "sglang.srt.model_executor.forward_batch_info.ForwardBatch.compute_spec_mrope_positions",
+            around_spec_mrope_positions,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.layers.sampler.Sampler._sample_from_probs",
+            around_seeded_sampler,
+            HookType.AROUND,
+        ),
+        (
+            HOOK_TARGETS["handle_speculative_decoding"],
+            after_handle_speculative_decoding,
+            HookType.AFTER,
+        ),
+        (
+            HOOK_TARGETS["spec_need_hidden_states"],
+            around_spec_need_hidden_states,
+            HookType.AROUND,
+        ),
+        (
+            HOOK_TARGETS["decode_cuda_graph_runner_cls"],
+            around_decode_cuda_graph_runner_cls,
+            HookType.AROUND,
+        ),
+        (
+            HOOK_TARGETS["config_draft_model"],
+            around_config_draft_model,
+            HookType.AROUND,
+        ),
+        (
+            HOOK_TARGETS["dflash_sampling_verify"],
+            around_dflash_sampling_verify,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.model_executor.runner_backend.full_cuda_graph_backend.FullCudaGraphBackend.capture_one",
+            head.around_capture,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.model_executor.runner_backend.full_cuda_graph_backend.FullCudaGraphBackend.cleanup",
+            head.around_cleanup,
+            HookType.AROUND,
+        ),
+    )
+    for target, hook, kind in hooks:
+        HookRegistry.register(target, hook, kind)
+    register_verify_cap_hooks()
+    register_ragged_gdn_hooks()
+    register_bf16_layout_hook()
+    replay.register()
+    if registered_spec(ALGORITHM) is None:
+        SpeculativeAlgorithm.register(
+            ALGORITHM, supports_overlap=True, spec_class=DSpineSpecAlgo
+        )(worker_factory)
+    _registered = True
