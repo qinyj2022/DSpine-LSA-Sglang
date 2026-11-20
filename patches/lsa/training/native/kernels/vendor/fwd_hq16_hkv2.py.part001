@@ -1,0 +1,388 @@
+cudaFuncAttributeMaxDynamicSharedMemorySize, (int)b2);
+      pset2 = b2;
+    }
+    if (sorted) plan_k<true, true><<<(int)nItems, 256, b2, stream>>>(sel.data_ptr<int>(), pl, ctr, T, HKV, G, TOPK, (int)window, (int)sink,
+        THR, nqblk, HB, (int)planWords, (int)offG, (int)offM, (float)dfac);
+    else plan_k<true, false><<<(int)nItems, 256, b2, stream>>>(sel.data_ptr<int>(), pl, ctr, T, HKV, G, TOPK, (int)window, (int)sink,
+        THR, nqblk, HB, (int)planWords, (int)offG, (int)offM, (float)dfac);
+  }
+  const float sl2 = (float)(scale * 1.4426950408889634);
+  if (D == 64) launch_attn<64, 0>(q, k, v, pl, ctr, o, lse, (int)window, (int)sink, sl2, (int)planWords, (int)offG, (int)offM, grid, stream);
+  else if (TOPK >= 512) launch_attn<128, 1>(q, k, v, pl, ctr, o, lse, (int)window, (int)sink, sl2, (int)planWords, (int)offG, (int)offM, grid, stream);
+  else launch_attn<128, 0>(q, k, v, pl, ctr, o, lse, (int)window, (int)sink, sl2, (int)planWords, (int)offG, (int)offM, grid, stream);
+}
+"""
+
+DENSE_SRC = r"""
+__global__ void __launch_bounds__(256) build_mask(const int* __restrict__ SEL, unsigned* __restrict__ MASK, int T, int HKV,
+                           int TOPK, int W, int window, int sink, int ROWS) {
+  pdl_trigger();
+  extern __shared__ unsigned sm[];
+  const int i0 = blockIdx.x * ROWS, hk = blockIdx.y, b = blockIdx.z;
+  const int nrows = min(ROWS, T - i0);
+  for (int x = threadIdx.x; x < nrows * W; x += 256) {
+    int r = x / W, w = x - r * W, i = i0 + r;
+    unsigned bits = 0;
+    if (window > 0) bits |= range_bits(max(0, i - window + 1), i, w);
+    if (sink > 0) bits |= range_bits(0, min(sink, i + 1) - 1, w);
+    sm[x] = bits;
+  }
+  __syncthreads();
+  const int* sb = SEL + ((size_t)(b * HKV + hk) * T + i0) * TOPK;
+  if ((TOPK & 3) == 0) {
+    const int4* sb4 = reinterpret_cast<const int4*>(sb);
+    const int n4 = nrows * TOPK / 4;
+    const int tk4 = TOPK / 4;
+    for (int base = threadIdx.x; base < n4; base += 256 * 8) {
+      int4 v[8];
+#pragma unroll
+      for (int k = 0; k < 8; ++k) {
+        int idx = base + k * 256;
+        v[k] = idx < n4 ? __ldg(sb4 + idx) : make_int4(-1, -1, -1, -1);
+      }
+#pragma unroll
+      for (int k = 0; k < 8; ++k) {
+        int idx = base + k * 256;
+        if (idx < n4) {
+          int r = idx / tk4;
+          unsigned* row = sm + r * W;
+          int jj[4] = {v[k].x, v[k].y, v[k].z, v[k].w};
+#pragma unroll
+          for (int e = 0; e < 4; ++e) {
+            int j = jj[e];
+            if (j >= 0 && j <= i0 + r) atomicOr(row + (j >> 5), 1u << (j & 31));
+          }
+        }
+      }
+    }
+  } else {
+    const int n = nrows * TOPK;
+    for (int base = threadIdx.x; base < n; base += 256 * 8) {
+      int v[8];
+#pragma unroll
+      for (int k = 0; k < 8; ++k) {
+        int idx = base + k * 256;
+        v[k] = idx < n ? __ldg(sb + idx) : -1;
+      }
+#pragma unroll
+      for (int k = 0; k < 8; ++k) {
+        int idx = base + k * 256;
+        int j = v[k];
+        if (idx < n && j >= 0) {
+          int r = idx / TOPK;
+          if (j <= i0 + r) atomicOr(sm + r * W + (j >> 5), 1u << (j & 31));
+        }
+      }
+    }
+  }
+  __syncthreads();
+  uint4* mb = reinterpret_cast<uint4*>(MASK + ((size_t)(b * HKV + hk) * T + i0) * W);
+  const uint4* s4 = reinterpret_cast<const uint4*>(sm);
+  for (int x = threadIdx.x; x < nrows * W / 4; x += 256) mb[x] = s4[x];
+}
+
+template <int D>
+struct DenseKCfg {
+  static constexpr int BM = 128, BN = 128;
+  static constexpr int NS = D == 128 ? 3 : 4;
+  static constexpr int QB = BM * D * 2, KB = BN * D * 2;
+  static constexpr int SMEM = QB + NS * 2 * KB + 1024;
+};
+
+template <int D>
+__global__ void __launch_bounds__(384, 1) attn_dense(
+    const __grid_constant__ CUtensorMap tmK, const __grid_constant__ CUtensorMap tmV, const __grid_constant__ CUtensorMap tmO,
+    const bf16* __restrict__ Q, const unsigned* __restrict__ MASK, bf16* __restrict__ O,
+    float* __restrict__ LSE, int B, int T, int HQ, int HKV, int W, float sl2, int nqblk) {
+  constexpr int BM = 128, BN = 128, CPR = D / 8, NO = D / 2;
+  constexpr int NS = DenseKCfg<D>::NS, QB = DenseKCfg<D>::QB, KB = DenseKCfg<D>::KB;
+  extern __shared__ unsigned char smem_raw[];
+  __shared__ __align__(8) unsigned long long bars[2 * NS];
+  const unsigned base = (unsigned)__cvta_generic_to_shared(smem_raw);
+  const unsigned sbase = (base + 1023u) & ~1023u;
+  const unsigned sQ = sbase;
+  const unsigned bar0 = (unsigned)__cvta_generic_to_shared(&bars[0]);
+  const float NEG = -INFINITY;
+
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  const int HB = HKV * B;
+  const int qblk = nqblk - 1 - (int)blockIdx.x / HB;
+  const int rest = (int)blockIdx.x % HB;
+  const int hk = rest % HKV, b = rest / HKV;
+  const int G = HQ / HKV, TG = T * G, R0 = qblk * BM;
+  const int qb = (min(R0 + BM, TG) - 1) / G;
+  const int ntile = qb / BN + 1;
+
+  if (tid == 0) {
+    for (int s = 0; s < NS; ++s) {
+      mbar_init(bar0 + 8 * s, 1);
+      mbar_init(bar0 + 8 * (NS + s), 256);
+    }
+    asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
+  }
+  __syncthreads();
+
+  if (warp >= 8) {
+    reg_dealloc<24>();
+    if (warp == 8 && lane == 0) {
+      for (int t = 0; t < ntile; ++t) {
+        const int s = t % NS, u = t / NS;
+        if (u > 0) mbar_wait(bar0 + 8 * (NS + s), (u - 1) & 1);
+        const unsigned full = bar0 + 8 * s;
+        mbar_expect_tx(full, 2 * KB);
+        const unsigned dk = sbase + QB + s * 2 * KB, dv = dk + KB;
+#pragma unroll
+        for (int p = 0; p < D / 64; ++p) {
+          tma_load_4d(dk + p * BN * 128, &tmK, p * 64, hk, t * BN, b, full);
+          tma_load_4d(dv + p * BN * 128, &tmV, p * 64, hk, t * BN, b, full);
+        }
+      }
+    }
+    return;
+  }
+  reg_alloc<240>();
+
+  const int c = warp >> 2;
+  const int wq = warp & 3;
+  const int wtid = tid & 127;
+  for (int x = wtid; x < 64 * CPR; x += 128) {
+    int r = c * 64 + x / CPR, cc = x % CPR;
+    int rg = min(R0 + r, TG - 1);
+    int i = rg / G, g = rg - i * G;
+    const bf16* src = Q + ((size_t)(b * T + i) * HQ + hk * G + g) * D + cc * 8;
+    unsigned dst = sQ + (cc >> 3) * (BM * 128) + r * 128 + (((cc & 7) ^ (r & 7)) << 4);
+    cp_async16s(dst, src);
+  }
+  cp_commit();
+
+  const int r0 = c * 64 + wq * 16 + (lane >> 2);
+  const int rg0 = R0 + r0, rg1 = rg0 + 8;
+  const int i0 = min(rg0, TG - 1) / G, i1 = min(rg1, TG - 1) / G;
+  const uint4* mr0 = reinterpret_cast<const uint4*>(MASK + ((size_t)(b * HKV + hk) * T + i0) * W);
+  const uint4* mr1 = reinterpret_cast<const uint4*>(MASK + ((size_t)(b * HKV + hk) * T + i1) * W);
+  const int sh = 2 * (lane & 3);
+
+  pdl_wait();
+  uint4 mw0 = __ldg(mr0), mw1 = __ldg(mr1);
+  uint4 nw0 = make_uint4(0, 0, 0, 0), nw1 = make_uint4(0, 0, 0, 0);
+  if (ntile > 1) { nw0 = __ldg(mr0 + 1); nw1 = __ldg(mr1 + 1); }
+
+  cp_wait<0>();
+  fence_proxy_async();
+  bar_sync(3 + c, 128);
+
+  float o[NO];
+#pragma unroll
+  for (int n = 0; n < NO; ++n) o[n] = 0.f;
+  float s[64];
+#pragma unroll
+  for (int n = 0; n < 64; ++n) s[n] = 0.f;
+  unsigned p[8][4];
+  float m0 = NEG, m1 = NEG, l0 = 0.f, l1 = 0.f;
+
+  auto issue_S = [&](int st) {
+    const unsigned kb = sbase + QB + st * 2 * KB;
+#pragma unroll
+    for (int kk = 0; kk < D / 16; ++kk) {
+      unsigned long long da = make_desc(sQ + (kk >> 2) * (BM * 128) + c * 64 * 128 + (kk & 3) * 32, 16, 1024);
+      unsigned long long db = make_desc(kb + (kk >> 2) * (BN * 128) + (kk & 3) * 32, 16, 1024);
+      wgmma_ss_n128(s, da, db, kk > 0 ? 1 : 0);
+    }
+  };
+  auto issue_PV = [&](int st) {
+    const unsigned vb = sbase + QB + st * 2 * KB + KB;
+#pragma unroll
+    for (int kk = 0; kk < BN / 16; ++kk) {
+      unsigned long long db = make_desc(vb + kk * 16 * 128, BN * 128, 1024);
+      if constexpr (D == 128) wgmma_rs_n128(o, p[kk], db, 1);
+      else wgmma_rs_n64(o, p[kk], db, 1);
+    }
+  };
+  auto softmax = [&](const uint4& mw0, const uint4& mw1, float& c0, float& c1) {
+    const unsigned wa[4] = {mw0.x >> sh, mw0.y >> sh, mw0.z >> sh, mw0.w >> sh};
+    const unsigned wb[4] = {mw1.x >> sh, mw1.y >> sh, mw1.z >> sh, mw1.w >> sh};
+#pragma unroll
+    for (int n = 0; n < 16; ++n) {
+      const unsigned x0 = wa[n >> 2], x1 = wb[n >> 2];
+      const int bp = (n & 3) * 8;
+      if (!(x0 & (1u << bp))) s[4 * n] = NEG;
+      if (!(x0 & (2u << bp))) s[4 * n + 1] = NEG;
+      if (!(x1 & (1u << bp))) s[4 * n + 2] = NEG;
+      if (!(x1 & (2u << bp))) s[4 * n + 3] = NEG;
+    }
+    float mx0 = NEG, mx1 = NEG;
+#pragma unroll
+    for (int n = 0; n < 16; ++n) {
+      mx0 = fmaxf(mx0, fmaxf(s[4 * n], s[4 * n + 1]));
+      mx1 = fmaxf(mx1, fmaxf(s[4 * n + 2], s[4 * n + 3]));
+    }
+    mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffff, mx0, 1));
+    mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffff, mx0, 2));
+    mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffff, mx1, 1));
+    mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffff, mx1, 2));
+    const float mn0 = fmaxf(m0, mx0), mn1 = fmaxf(m1, mx1);
+    const float mu0 = mn0 == NEG ? 0.f : mn0 * sl2, mu1 = mn1 == NEG ? 0.f : mn1 * sl2;
+    c0 = exp2f(m0 * sl2 - mu0); c1 = exp2f(m1 * sl2 - mu1);
+    m0 = mn0; m1 = mn1;
+    float sum0 = 0.f, sum1 = 0.f;
+#pragma unroll
+    for (int n = 0; n < 16; ++n) {
+      s[4 * n] = exp2f(fmaf(s[4 * n], sl2, -mu0));
+      s[4 * n + 1] = exp2f(fmaf(s[4 * n + 1], sl2, -mu0));
+      s[4 * n + 2] = exp2f(fmaf(s[4 * n + 2], sl2, -mu1));
+      s[4 * n + 3] = exp2f(fmaf(s[4 * n + 3], sl2, -mu1));
+      sum0 += s[4 * n] + s[4 * n + 1];
+      sum1 += s[4 * n + 2] + s[4 * n + 3];
+    }
+    l0 = l0 * c0 + sum0; l1 = l1 * c1 + sum1;
+  };
+  auto pack_p = [&]() {
+#pragma unroll
+    for (int n = 0; n < 16; ++n) {
+      p[n >> 1][(n & 1) * 2 + 0] = pack_bf16(s[4 * n], s[4 * n + 1]);
+      p[n >> 1][(n & 1) * 2 + 1] = pack_bf16(s[4 * n + 2], s[4 * n + 3]);
+    }
+  };
+
+  const int my_bar = 1 + c, other_bar = 2 - c;
+  if (c == 1) bar_arrive(1, 256);
+
+  float c0, c1;
+  mbar_wait(bar0, 0);
+  bar_sync(my_bar, 256);
+  wg_fence();
+  issue_S(0);
+  wg_commit();
+  bar_arrive(other_bar, 256);
+  wg_wait<0>();
+#pragma unroll
+  for (int n = 0; n < 64; ++n) fence_reg(s[n]);
+  softmax(mw0, mw1, c0, c1);
+  pack_p();
+  mw0 = nw0; mw1 = nw1;
+
+  for (int t = 1; t < ntile; ++t) {
+    const int st = t % NS;
+    if (t + 1 < ntile) { nw0 = __ldg(mr0 + t + 1); nw1 = __ldg(mr1 + t + 1); }
+    mbar_wait(bar0 + 8 * st, (t / NS) & 1);
+    bar_sync(my_bar, 256);
+    wg_fence();
+    issue_S(st);
+    wg_commit();
+    issue_PV((t - 1) % NS);
+    wg_commit();
+    bar_arrive(other_bar, 256);
+    wg_wait<1>();
+#pragma unroll
+    for (int n = 0; n < 64; ++n) fence_reg(s[n]);
+    softmax(mw0, mw1, c0, c1);
+    wg_wait<0>();
+#pragma unroll
+    for (int n = 0; n < NO; ++n) fence_reg(o[n]);
+#pragma unroll
+    for (int k2 = 0; k2 < 8; ++k2)
+#pragma unroll
+      for (int j2 = 0; j2 < 4; ++j2) fence_ureg(p[k2][j2]);
+    mbar_arrive(bar0 + 8 * (NS + (t - 1) % NS));
+#pragma unroll
+    for (int n = 0; n < NO / 4; ++n) {
+      o[4 * n] *= c0; o[4 * n + 1] *= c0; o[4 * n + 2] *= c1; o[4 * n + 3] *= c1;
+    }
+    pack_p();
+    mw0 = nw0; mw1 = nw1;
+  }
+  bar_sync(my_bar, 256);
+  wg_fence();
+  issue_PV((ntile - 1) % NS);
+  wg_commit();
+  if (c == 0) bar_arrive(other_bar, 256);
+  wg_wait<0>();
+#pragma unroll
+  for (int n = 0; n < NO; ++n) fence_reg(o[n]);
+
+  l0 += __shfl_xor_sync(0xffffffff, l0, 1);
+  l0 += __shfl_xor_sync(0xffffffff, l0, 2);
+  l1 += __shfl_xor_sync(0xffffffff, l1, 1);
+  l1 += __shfl_xor_sync(0xffffffff, l1, 2);
+  const float inv0 = l0 > 0.f ? 1.f / l0 : 0.f, inv1 = l1 > 0.f ? 1.f / l1 : 0.f;
+  {
+    const int ra = r0, rb = r0 + 8;
+#pragma unroll
+    for (int k2 = 0; k2 < D / 8; ++k2) {
+      const unsigned pa = sQ + (k2 >> 3) * (BM * 128) + ra * 128 + (((k2 & 7) ^ (ra & 7)) << 4) + sh * 2;
+      const unsigned pb = sQ + (k2 >> 3) * (BM * 128) + rb * 128 + (((k2 & 7) ^ (rb & 7)) << 4) + sh * 2;
+      st_shared_u32(pa, pack_bf16(o[4 * k2] * inv0, o[4 * k2 + 1] * inv0));
+      st_shared_u32(pb, pack_bf16(o[4 * k2 + 2] * inv1, o[4 * k2 + 3] * inv1));
+    }
+  }
+  if (rg0 < TG) {
+    int i = rg0 / G, g = rg0 - i * G;
+    if ((lane & 3) == 0)
+      LSE[((size_t)b * HQ + hk * G + g) * T + i] = l0 > 0.f ? (m0 * sl2 + log2f(l0)) * 0.69314718055994531f : NEG;
+  }
+  if (rg1 < TG) {
+    int i = rg1 / G, g = rg1 - i * G;
+    if ((lane & 3) == 0)
+      LSE[((size_t)b * HQ + hk * G + g) * T + i] = l1 > 0.f ? (m1 * sl2 + log2f(l1)) * 0.69314718055994531f : NEG;
+  }
+  fence_proxy_async();
+  bar_sync(5, 256);
+  const int pf = R0 / G;
+  if (pf + BM / G <= T) {
+    if (tid == 0) {
+#pragma unroll
+      for (int pp = 0; pp < D / 64; ++pp)
+        tma_store_4d(sQ + pp * BM * 128, &tmO, pp * 64, hk * G, pf, b);
+      tma_store_wait();
+    }
+  } else {
+#pragma unroll
+  for (int j = 0; j < (64 * CPR) / 128; ++j) {
+    const int xx = j * 128 + wtid;
+    const int lr = xx / CPR, ch = xx % CPR;
+    const int r = c * 64 + lr;
+    const int rg = R0 + r;
+    if (rg < TG) {
+      int i = rg / G, g = rg - i * G;
+      const uint4 v = ld_shared_v4(sQ + (ch >> 3) * (BM * 128) + r * 128 + (((ch & 7) ^ (r & 7)) << 4));
+      *reinterpret_cast<uint4*>(O + ((size_t)(b * T + i) * HQ + hk * G + g) * D + ch * 8) = v;
+    }
+  }
+  }
+}
+"""
+
+DEV = HEADER + _gen(128, False) + _gen(128, True) + _gen(64, True) + KERN + DENSE_SRC
+
+_ext = load_inline(
+    name="lsa_fwd_hq16_hkv2",
+    cpp_sources="void sparse_fwd(torch::Tensor q, torch::Tensor k, torch::Tensor v, "
+    "torch::Tensor sel, torch::Tensor o, torch::Tensor lse, int64_t window, int64_t sink, double scale, int64_t thr, double dfac, bool sorted);",
+    cuda_sources=DEV + HOST,
+    functions=["sparse_fwd"],
+    extra_cuda_cflags=["-O3", "--use_fast_math", "-gencode=arch=compute_90a,code=sm_90a"],
+)
+
+THR = 112
+DFAC = 1.0
+
+
+def _attention(q, k, v, selected, window=0, sink=0, scale=None, sorted=False):
+    b, t, hq, d = q.shape
+    scale = d ** -0.5 if scale is None else scale
+    q = q.contiguous(); k = k.contiguous(); v = v.contiguous()
+    selected = selected.contiguous()
+    if selected.dtype != torch.int32:
+        selected = selected.to(torch.int32)
+    o = torch.empty_like(q)
+    lse = torch.empty(b, hq, t, dtype=torch.float32, device=q.device)
+    _ext.sparse_fwd(q, k, v, selected, o, lse, int(window), int(sink), float(scale), THR, DFAC, bool(sorted))
+    return o, lse
+
+
+def attention(q, k, v, selected, window=0, sink=0, scale=None):
+    return _attention(q, k, v, selected, window, sink, scale, False)
+
+
+def attention_sorted(q, k, v, selected, window=0, sink=0, scale=None):
+    return _attention(q, k, v, selected, window, sink, scale, True)
