@@ -1,0 +1,201 @@
+l.tensor,
+    pages_stride: tl.tensor,
+    carried_stride: tl.tensor,
+    out_stride: tl.tensor,
+    max_pages: tl.tensor,
+    D: tl.constexpr,
+    PAGE_ROWS: tl.constexpr,
+    BLOCK_POSITIONS: tl.constexpr,
+    BLOCK_BUCKETS: tl.constexpr,
+    CARRIED: tl.constexpr,
+    WIDTH: tl.constexpr,
+    BLOCK: tl.constexpr,
+    LENGTH_BLOCK: tl.constexpr,
+) -> None:
+    """Name the buckets one request scores at level 0 and score them, one program a block of columns.
+
+    One program past the blocks writes the query's length.
+
+    Args:
+        positions_ptr: Each query's position [B] int32.
+        rows_ptr: The batch's request table rows [B] int64.
+        covered_ptr: Buckets under a node bucket, a request [R] int32.
+        pages_ptr: The cache's page table [R, max_pages] int32, -1 for none.
+        carried_ptr: Cache rows the level 1 beam kept [B, CARRIED] int32, -1 for none.
+        index_query_ptr: Index queries [B, D] bf16.
+        bucket_centroids_ptr: The cache's centroid rows [rows, D] bf16.
+        candidates_ptr: Cache rows [B, WIDTH] int32, -1 for none.
+        scores_ptr: Scores [B, WIDTH] fp32, -inf under a -1.
+        lengths_ptr: Columns each query holds up to its last valid one [B] int32.
+    """
+    query = tl.program_id(0).to(tl.int64)
+    if tl.program_id(1) < tl.num_programs(1) - 1:
+        columns = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+        pooled = _pick_pooled(
+            positions_ptr,
+            rows_ptr,
+            covered_ptr,
+            pages_ptr,
+            carried_ptr,
+            query,
+            columns,
+            pages_stride,
+            carried_stride,
+            max_pages,
+            PAGE_ROWS,
+            BLOCK_POSITIONS,
+            BLOCK_BUCKETS,
+            CARRIED,
+        )
+        inside = columns < WIDTH
+        tl.store(candidates_ptr + query * out_stride + columns, pooled, mask=inside)
+        score = _score_rows(index_query_ptr, bucket_centroids_ptr, pooled.to(tl.int64), query, 1.0, D)
+        tl.store(scores_ptr + query * out_stride + columns, score, mask=inside)
+    else:
+        tl.store(
+            lengths_ptr + query,
+            _pick_length(
+                positions_ptr,
+                rows_ptr,
+                covered_ptr,
+                carried_ptr,
+                query,
+                carried_stride,
+                BLOCK_POSITIONS,
+                BLOCK_BUCKETS,
+                WIDTH,
+                CARRIED,
+                LENGTH_BLOCK,
+            ),
+        )
+
+
+def pick_scores(
+    positions: torch.Tensor,
+    rows: torch.Tensor,
+    covered: torch.Tensor,
+    pages: torch.Tensor,
+    carried: torch.Tensor,
+    index_queries: torch.Tensor,
+    bucket_centroids: torch.Tensor,
+    page_rows: int,
+    block_positions: int,
+    block_buckets: int,
+    width: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Name the buckets each request scores at level 0 and score them, in one launch.
+
+    The same as `pick_candidates` then `score_children`, but every column's score is written, -inf under a -1 row.
+
+    Args:
+        positions: Each query's position [B] int32.
+        rows: The batch's request table rows [B] int64.
+        covered: Buckets under a node bucket, a request [R] int32.
+        pages: The cache's page table [R, max_pages] int32, -1 for none.
+        carried: Cache rows the level 1 beam kept [B, C] int32, -1 for none.
+        index_queries: One index query a row [B, index_dim] bf16.
+        bucket_centroids: The cache's centroid rows [rows, index_dim] bf16.
+        page_rows: Cache rows a page holds.
+        block_positions: Positions of a cluster block.
+        block_buckets: Buckets of a cluster block.
+        width: Columns of the result.
+
+    Returns:
+        Cache rows [B, width] int32, their scores [B, width] fp32, and the columns each query holds up to its last
+        valid one [B] int32.
+    """
+    count = len(rows)
+    candidates = torch.empty(count, width, device=rows.device, dtype=torch.int32)
+    scores = torch.empty(count, width, device=rows.device, dtype=torch.float32)
+    lengths = torch.empty(count, device=rows.device, dtype=torch.int32)
+    block = TritonBeam.BLOCK
+    _pick_scores_kernel[(count, triton.cdiv(width, block) + 1)](
+        positions,
+        rows,
+        covered,
+        pages,
+        carried,
+        index_queries,
+        bucket_centroids,
+        candidates,
+        scores,
+        lengths,
+        pages.stride(0),
+        carried.stride(0),
+        candidates.stride(0),
+        pages.shape[1],
+        D=index_queries.shape[1],
+        PAGE_ROWS=page_rows,
+        BLOCK_POSITIONS=block_positions,
+        BLOCK_BUCKETS=block_buckets,
+        CARRIED=carried.shape[1],
+        WIDTH=width,
+        BLOCK=block,
+        LENGTH_BLOCK=TritonBeam.LENGTH_BLOCK,
+    )
+    return candidates, scores, lengths
+
+
+@triton.jit
+def _cache_row_keys_kernel(
+    keys_ptr: tl.tensor,
+    listed_ptr: tl.tensor,
+    candidates_ptr: tl.tensor,
+    out_ptr: tl.tensor,
+    key_stride: tl.tensor,
+    candidates_stride: tl.tensor,
+    COLUMNS: tl.constexpr,
+    WIDTH: tl.constexpr,
+    BLOCK: tl.constexpr,
+) -> None:
+    """Replace the columns a listing names with the cache rows they stand for, keeping the scores in the keys.
+
+    Args:
+        keys_ptr: Listed columns packed with their scores [S, WIDTH] int64.
+        listed_ptr: Keys each row lists [S] int32.
+        candidates_ptr: The cache row of each column [S, COLUMNS] int32, -1 for none.
+        out_ptr: Scores packed with cache rows [S, WIDTH] int64, EMPTY for an invalid key.
+    """
+    row = tl.program_id(0).to(tl.int64)
+    slots = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    inside = slots < WIDTH
+    key = tl.load(keys_ptr + row * key_stride + slots, mask=inside, other=EMPTY_KEY)
+    never = ordered_bits(tl.full([], float("-inf"), tl.float32))
+    valid = (
+        inside & (slots < tl.load(listed_ptr + row)) & (key != EMPTY_KEY) & ((key >> 32).to(tl.int32) > never)
+    )
+    column = tl.minimum(tl.maximum(key_bucket(key), 0), COLUMNS - 1)
+    cache_row = tl.load(candidates_ptr + row * candidates_stride + column, mask=valid, other=-1).to(tl.int64)
+    valid &= cache_row >= 0
+    packed = ((key >> 32) << 32) | (0x7FFFFFFF - cache_row)
+    tl.store(out_ptr + row * WIDTH + slots, tl.where(valid, packed, EMPTY_KEY), mask=inside)
+
+
+def cache_row_keys(keys: torch.Tensor, listed: torch.Tensor, candidates: torch.Tensor) -> torch.Tensor:
+    """Replace the columns a listing names with the cache rows they stand for, keeping the scores in the keys.
+
+    Args:
+        keys: Listed columns packed with their scores [S, W] int64.
+        listed: Keys each row lists [S] int32.
+        candidates: The cache row of each column [S, N] int32, -1 for none.
+
+    Returns:
+        Scores packed with cache rows [S, W] int64, the empty key for a column that is no bucket, was scored -inf or
+        was never listed.
+    """
+    count, width = keys.shape
+    out = torch.empty(count, width, dtype=torch.int64, device=keys.device)
+    block = min(triton.next_power_of_2(width), 256)
+    _cache_row_keys_kernel[(count, triton.cdiv(width, block))](
+        keys,
+        listed,
+        candidates,
+        out,
+        keys.stride(0),
+        candidates.stride(0),
+        COLUMNS=candidates.shape[1],
+        WIDTH=width,
+        BLOCK=block,
+        num_warps=4,
+    )
+    return out
