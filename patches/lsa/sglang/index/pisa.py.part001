@@ -1,0 +1,84 @@
+   """
+        table = self.slot_table()
+        leaf_keys = LeafKeys(table, row_index, self.key_buffer()[:, self.head, : self.key_dim])
+        key_ids = select(
+            self.leaf_means.levels,
+            min(leaf_count, self.leaf_means.means.shape[1]),
+            leaf_keys,
+            queries,
+            requests,
+            positions.long(),
+            self.config,
+            logit_scale,
+            None if every_head else self.reduce_scores,
+        )
+        slots = table[row_index[requests][:, None], key_ids.clamp(min=0).long()]
+        return slots.masked_fill(key_ids < 0, -1).int()
+
+    def check(
+        self,
+        queries: torch.Tensor,
+        positions: torch.Tensor,
+        slots: torch.Tensor,
+        row: int,
+        key_count: int,
+        logit_scale: float,
+    ) -> list["CheckedRow"]:
+        """Hold a few of a request's served lists against the reference search over the same keys and queries.
+
+        The reference runs on the host, a row at a time, so this is for a debugging run.
+
+        Args:
+            queries: The checked rows' heads' queries [rows, ..., key_dim].
+            positions: Their positions [rows] int.
+            slots: The lists the index served them [rows, width] int32.
+            row: The request's table row.
+            key_count: Keys the request holds in the pool.
+            logit_scale: What the dots are multiplied by.
+
+        Returns:
+            Each row's position, the keys both lists hold, the keys each holds, and the reference's nearest tie.
+        """
+        config = self.config
+        table_row = self.slot_table()[row, :key_count].long()
+        keys = self.keys_at_slots(table_row).float().cpu()
+        selection = reference.select(
+            keys[:, None],
+            queries.reshape(positions.shape[0], -1, self.key_dim).float().cpu(),
+            positions.cpu().long(),
+            config.block_size,
+            config.keep_count,
+            config.branching,
+            config.beam_width,
+            logit_scale,
+            config.forced_blocks,
+        )
+        expected = selection.selected_key_ids[:, 0]
+        gaps = selection.boundary_gaps[:, 0].amin(-1)
+        # A served slot back to its position in the request
+        order = table_row.argsort()
+        served = order[torch.searchsorted(table_row[order], slots.long().clamp(min=0))].cpu()
+        served = served.masked_fill(slots.cpu() < 0, -1)
+        checked = []
+        for position, mine, theirs, gap in zip(
+            positions.tolist(), served, expected, gaps.tolist(), strict=True
+        ):
+            held, wanted = set(mine[mine >= 0].tolist()), set(theirs[theirs >= 0].tolist())
+            checked.append(CheckedRow(position, len(held & wanted), len(held), len(wanted), gap))
+        return checked
+
+
+def refuse_rope(config: Any) -> None:
+    """Refuse a model whose latent carries rope dims, which the absorbed queries would then carry too.
+
+    Args:
+        config: The model's text config.
+
+    Raises:
+        ValueError: `qk_rope_head_dim` is not 0 - the search scores the latent alone.
+    """
+    if int(getattr(config, "qk_rope_head_dim", 0)) != 0:
+        raise ValueError(
+            f"PISA scores the key latent against the absorbed query and reads no rope dims - "
+            f"got qk_rope_head_dim {config.qk_rope_head_dim}"
+        )
