@@ -1,0 +1,560 @@
+ads):
+            key = cutlass.Int64(PackedKey.EMPTY)
+            if slot < want:
+                column = cutlass.Int32(kept[slot])
+                word = cutlass.Uint32(words[column])
+                cache_row = candidates[row, column]
+                if word > cutlass.Uint32(CuteBeam.NEG_INF_WORD) and cache_row >= 0:
+                    ordered = cutlass.Int32(word ^ cutlass.Uint32(0x80000000))
+                    key = (cutlass.Int64(ordered) << 32) | cutlass.Int64(0x7FFFFFFF - cache_row)
+            out[row, slot] = key
+        if thread == 0:
+            listed[row] = keep
+
+
+COMPILED: dict[tuple[int, int, int, bool, bool], Any] = {}
+COMPILED_PICKS: dict[tuple[int, int], Any] = {}
+COMPILED_SCORED_PICKS: dict[int, Any] = {}
+
+
+def room(width: int, keep: int) -> tuple[int, int]:
+    """Return the words a row's listing above its sampled threshold holds, 0 for a row searched whole, and the words
+    past the row the CTA takes.
+
+    Args:
+        width: Columns a query scores.
+        keep: Columns a query keeps.
+    """
+    if width < max(CuteBeam.SAMPLED_FROM * keep, CuteBeam.SAMPLES):
+        return 0, kept_words(keep)
+    listing_room = math.ceil(CuteBeam.HOLD * keep)
+    return listing_room, max(listing_room, kept_words(keep))
+
+
+def threads_for(carried_count: int, shared_bytes: int) -> int:
+    """Return a beam step's threads - the scoring threads for a level that scores children within its share of
+    shared memory, the reading threads otherwise.
+
+    Args:
+        carried_count: Rows a query scores.
+        shared_bytes: Shared memory a CTA takes.
+    """
+    return (
+        CuteBeam.SCORING_THREADS
+        if carried_count and shared_bytes <= CuteBeam.SCORING_SHARED_BYTES
+        else CuteBeam.READING_THREADS
+    )
+
+
+def kept_words(keep: int) -> int:
+    """Return the words of shared memory a row's kept columns take, two to a word.
+
+    Args:
+        keep: Columns a query keeps.
+    """
+    return (keep + 1) // 2
+
+
+def supports(
+    index_queries: torch.Tensor,
+    centroids: torch.Tensor,
+    carried: torch.Tensor,
+    open_count: int,
+    keep: int,
+    shape_rank: int | None = None,
+) -> bool:
+    """Tell whether the CuTeDSL beam step takes these rows.
+
+    It takes 64 index dims, bf16 queries, fp8 or bf16 centroids, shapes of SHAPE_RANK directions if any, and a row
+    and its kept columns that fit a CTA's shared memory.
+
+    Args:
+        index_queries: Index queries [S, index_dim].
+        centroids: The closed node buckets' centroids [N, index_dim].
+        carried: The carried rows [S, C].
+        open_count: Open node buckets.
+        keep: Columns a query keeps.
+        shape_rank: Directions of the closed node buckets' shapes, or None when they are unshaped.
+    """
+    return (
+        shape_rank in (None, ShapedRead.RANK)
+        and open_count + carried.shape[1] + room(open_count + carried.shape[1], keep)[1]
+        <= CuteBeam.SHARED_WORDS
+        and index_queries.shape[1] == Index.DIM
+        and index_queries.dtype == torch.bfloat16
+        and centroids.dtype in (torch.float8_e4m3fn, torch.bfloat16)
+        and centroids.is_contiguous()
+        and centroids.data_ptr() % 16 == 0
+        and carried.stride(1) == 1
+    )
+
+
+def compiled(
+    element_bytes: int, node_bucket_size: int, threads: int, shaped: bool, scored: bool = False
+) -> Any:
+    """Return the beam step compiled once a precision and node bucket size, taking torch tensors as they are.
+
+    Args:
+        element_bytes: Bytes a centroid entry takes - 1 for fp8, 2 for bf16.
+        node_bucket_size: Children a node bucket holds.
+        threads: Threads of a CTA.
+        shaped: Whether a carried row's score adds its shape's spread.
+        scored: Whether the whole row arrives scored.
+    """
+    key = (element_bytes, node_bucket_size, threads, shaped, scored)
+    if key in COMPILED:
+        return COMPILED[key]
+    rows, open_count, carried_count, centroid_count, closed_count, width, shape_count, open_rows = (
+        cute.sym_int32() for _ in range(8)
+    )
+    query_stride, score_stride, open_stride, carried_stride, closed_stride, out_stride = (
+        cute.sym_int64() for _ in range(6)
+    )
+    centroid_type = cutlass.Float8E4M3FN if element_bytes == 1 else cutlass.BFloat16
+    arguments = (
+        make_fake_tensor(cutlass.BFloat16, (rows, Index.DIM), stride=(query_stride, 1), assumed_align=16),
+        make_fake_tensor(cutlass.Float32, (rows, open_count), stride=(score_stride, 1), assumed_align=4),
+        make_fake_tensor(
+            cutlass.Int32, (open_rows, node_bucket_size), stride=(open_stride, 1), assumed_align=4
+        ),
+        make_fake_tensor(cutlass.Int32, (rows, carried_count), stride=(carried_stride, 1), assumed_align=4),
+        make_fake_compact_tensor(
+            centroid_type, (centroid_count, Index.DIM), stride_order=(1, 0), assumed_align=16
+        ),
+        make_fake_tensor(
+            cutlass.Int32, (closed_count, node_bucket_size), stride=(closed_stride, 1), assumed_align=4
+        ),
+        make_fake_tensor(cutlass.Int32, (rows, width), stride=(out_stride, 1), assumed_align=4),
+        make_fake_compact_tensor(cutlass.Int32, (rows,)),
+        cutlass.Int32(1),
+        cutlass.Int32(1),
+        cutlass.Int32(1),
+        cutlass.Int32(1),
+        cutlass.Float32(1.0),
+        make_fake_compact_tensor(
+            cutlass.Int32, (shape_count, ShapedRead.RANK * ShapedRead.WORDS), stride_order=(1, 0)
+        ),
+        make_fake_compact_tensor(cutlass.Float32, (shape_count, ShapedRead.RANK), stride_order=(1, 0)),
+        make_fake_compact_tensor(cutlass.Float32, (shape_count,)),
+        make_fake_compact_tensor(
+            cutlass.Int32, (rows, ShapedRead.QUERY_BITS * ShapedRead.WORDS), stride_order=(1, 0)
+        ),
+        make_fake_compact_tensor(cutlass.Float32, (rows, 2), stride_order=(1, 0)),
+        cutlass.Float32(1.0),
+        cutlass.Int32(1),
+        make_fake_stream(use_tvm_ffi_env_stream=True),
+    )
+    kernel = BeamStep(element_bytes, node_bucket_size, threads, shaped, scored)
+    COMPILED[key] = cute.compile(kernel, *arguments, options="--enable-tvm-ffi")
+    return COMPILED[key]
+
+
+def beam_step(
+    index_queries: torch.Tensor,
+    open_scores: torch.Tensor,
+    open_children: torch.Tensor,
+    carried: torch.Tensor,
+    centroids: torch.Tensor,
+    closed_children: torch.Tensor,
+    keep: int,
+    centroid_scale: float,
+    shapes: tuple[torch.Tensor, torch.Tensor, torch.Tensor, float] | None = None,
+    lengths: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Keep each query's best `keep` of its open node buckets and carried children, and name their children.
+
+    Args:
+        index_queries: Index queries [S, 64] bf16.
+        open_scores: The open node buckets' scores [S, open] fp32.
+        open_children: Their children [open, node_bucket_size] int32.
+        carried: The children the level above kept [S, C] int32, -1 for none.
+        centroids: The closed node buckets' centroids [N, 64] the carried rows name - bf16, or fp8 holding
+            `centroid_scale` times the row.
+        closed_children: Their children [N, node_bucket_size] int32.
+        keep: Columns a query keeps, the beam's width.
+        centroid_scale: What fp8 centroids were multiplied by on storing; 1 for bf16.
+        shapes: The closed node buckets' packed sign basis [N, SHAPE_RANK, 8] uint8, variances [N, SHAPE_RANK] fp32
+            and floors [N] fp32, and the deviations their scores add - None when they are unshaped.
+        lengths: Carried columns each query scores [S] int32 - the first of its carried rows, the rest ignored - or
+            None for all of them. A query keeps at most as many columns as it scores, and its other slots hold no children.
+
+    Returns:
+        The kept node buckets' children [S, keep * node_bucket_size] int32 - a kept bucket's side by side in column
+        order, -1 where a query kept nothing.
+
+    Raises:
+        ValueError: The rows are not ones the kernel takes.
+    """
+    open_count = open_scores.shape[1]
+    shape_rank = None if shapes is None else shapes[1].shape[1]
+    if not supports(index_queries, centroids, carried, open_count, keep, shape_rank):
+        raise ValueError(
+            "the CuTeDSL beam step takes bf16 index queries of 64 dims over contiguous fp8 or bf16 centroids, shapes "
+            f"of {ShapedRead.RANK} directions, and a row and its kept within {CuteBeam.SHARED_WORDS} words - got "
+            f"{index_queries.dtype} {tuple(index_queries.shape)}, {centroids.dtype} {tuple(centroids.shape)}, shapes "
+            f"of {shape_rank} directions and {open_count} + {carried.shape[1]} columns"
+        )
+    rows = index_queries.shape[0]
+    node_bucket_size = closed_children.shape[1]
+    width = open_count + carried.shape[1]
+    listing_room, spare = room(width, keep)
+    out = torch.empty(rows, keep * node_bucket_size, device=index_queries.device, dtype=torch.int32)
+    if rows == 0:
+        return out
+    if open_count == 0:
+        # Nothing reads them, but CuTe wants a tensor
+        open_scores = torch.empty(rows, 1, device=index_queries.device)
+        open_children = torch.empty(1, node_bucket_size, device=index_queries.device, dtype=torch.int32)
+    threads = threads_for(carried.shape[1], (CuteBeam.FIXED_WORDS + width + spare) * 4)
+    basis, variances, floor, planes, query_terms, deviations = shape_arguments(index_queries, shapes)
+    compiled(centroids.element_size(), node_bucket_size, threads, shapes is not None)(
+        index_queries.contiguous(),
+        open_scores,
+        open_children.contiguous(),
+        carried,
+        centroids,
+        closed_children.contiguous(),
+        out,
+        torch.empty(rows, device=out.device, dtype=torch.int32) if lengths is None else lengths,
+        open_count,
+        keep,
+        listing_room,
+        int(lengths is not None),
+        1.0 / centroid_scale,
+        basis,
+        variances,
+        floor,
+        planes,
+        query_terms,
+        deviations,
+        (CuteBeam.FIXED_WORDS + width + spare) * 4,
+    )
+    return out
+
+
+def keep_scored(
+    index_queries: torch.Tensor,
+    scores: torch.Tensor,
+    candidates: torch.Tensor,
+    centroids: torch.Tensor,
+    closed_children: torch.Tensor,
+    keep: int,
+    lengths: torch.Tensor,
+) -> torch.Tensor:
+    """Keep each query's best `keep` columns of a row already scored, and name their children.
+
+    The scores are the Triton scorer's, so the kept columns are the Triton keep's: the greatest by score, a tie to the
+    lower column, in column order.
+
+    Args:
+        index_queries: Index queries [S, 64] bf16, which nothing reads.
+        scores: The row's scores [S, W] fp32, read to each query's length.
+        candidates: The rows of the level's pool each column names [S, W] int32, -1 for none.
+        centroids: The pool's centroids [N, 64], which nothing reads - bf16, or fp8.
+        closed_children: The pool's children [N, node_bucket_size] int32.
+        keep: Columns a query keeps, the beam's width.
+        lengths: Columns each query holds [S] int32.
+
+    Returns:
+        The kept columns' children [S, keep * node_bucket_size] int32 in column order, -1 where a query kept nothing.
+
+    Raises:
+        ValueError: The rows are not ones the kernel takes.
+    """
+    if not supports(index_queries, centroids, candidates, 0, keep) or scores.stride(1) != 1:
+        raise ValueError(
+            "the CuTeDSL scored keep takes bf16 index queries of 64 dims over contiguous fp8 or bf16 centroids and a "
+            f"row and its kept within {CuteBeam.SHARED_WORDS} words - got {index_queries.dtype} {tuple(index_queries.shape)}, "
+            f"{centroids.dtype} {tuple(centroids.shape)} and {candidates.shape[1]} columns"
+        )
+    rows, width = scores.shape
+    node_bucket_size = closed_children.shape[1]
+    listing_room, spare = room(width, keep)
+    out = torch.empty(rows, keep * node_bucket_size, device=scores.device, dtype=torch.int32)
+    if rows == 0:
+        return out
+    basis, variances, floor, planes, query_terms, deviations = shape_arguments(index_queries, None)
+    shared_bytes = (CuteBeam.FIXED_WORDS + width + spare) * 4
+    compiled(centroids.element_size(), node_bucket_size, CuteBeam.SCORED_THREADS, False, True)(
+        index_queries.contiguous(),
+        scores,
+        closed_children[:0],
+        candidates,
+        centroids,
+        closed_children.contiguous(),
+        out,
+        lengths,
+        width,
+        keep,
+        listing_room,
+        1,
+        1.0,
+        basis,
+        variances,
+        floor,
+        planes,
+        query_terms,
+        deviations,
+        shared_bytes,
+    )
+    return out
+
+
+def compiled_scored_pick() -> Any:
+    """Return the pick over scored rows compiled once, taking torch tensors as they are.
+
+    Returns:
+        The compiled pick.
+    """
+    if 0 in COMPILED_SCORED_PICKS:
+        return COMPILED_SCORED_PICKS[0]
+    rows, width, keep = (cute.sym_int32() for _ in range(3))
+    score_stride, candidate_stride, out_stride = (cute.sym_int64() for _ in range(3))
+    arguments = (
+        make_fake_tensor(cutlass.Float32, (rows, width), stride=(score_stride, 1), assumed_align=4),
+        make_fake_tensor(cutlass.Int32, (rows, width), stride=(candidate_stride, 1), assumed_align=4),
+        make_fake_compact_tensor(cutlass.Int32, (rows,)),
+        make_fake_tensor(cutlass.Int64, (rows, keep), stride=(out_stride, 1), assumed_align=8),
+        make_fake_compact_tensor(cutlass.Int32, (rows,)),
+        cutlass.Int32(1),
+        cutlass.Int32(1),
+        make_fake_stream(use_tvm_ffi_env_stream=True),
+    )
+    COMPILED_SCORED_PICKS[0] = cute.compile(
+        ScoredPick(1, CuteBeam.SCORED_THREADS), *arguments, options="--enable-tvm-ffi"
+    )
+    return COMPILED_SCORED_PICKS[0]
+
+
+def supports_scored_pick(width: int, top_p: int) -> bool:
+    """Tell whether the CuTeDSL pick takes scored rows of this width - a row and its kept fit a CTA's shared memory.
+
+    Args:
+        width: Columns a query's row holds.
+        top_p: Buckets a query picks.
+
+    Returns:
+        Whether the pick takes the rows.
+    """
+    return width + room(width, min(top_p, width))[1] <= CuteBeam.SHARED_WORDS
+
+
+def pick_scored(
+    scores: torch.Tensor, candidates: torch.Tensor, lengths: torch.Tensor, top_p: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pick each query's best `top_p` columns of a scored row, keyed by their cache rows.
+
+    Args:
+        scores: The row's scores [S, W] fp32, read to each query's length.
+        candidates: The cache row of each column [S, W] int32, -1 for none.
+        lengths: Columns each query holds [S] int32.
+        top_p: Buckets a query picks.
+
+    Returns:
+        The picked scores packed with their cache rows [S, min(W, top_p)] int64 in column order, the empty key for a
+        column scored -inf, with no row, or past the query's length, and the keys each query lists [S] int32 - all
+        of them.
+
+    Raises:
+        ValueError: The rows are not ones the kernel takes.
+    """
+    rows, width = scores.shape
+    keep = min(top_p, width)
+    if not supports_scored_pick(width, top_p) or scores.stride(1) != 1 or candidates.stride(1) != 1:
+        raise ValueError(
+            f"the CuTeDSL scored pick takes a row and its kept within {CuteBeam.SHARED_WORDS} words of contiguous columns - "
+            f"got {width} columns of strides {scores.stride(1)} and {candidates.stride(1)} and a top-p of {top_p}"
+        )
+    out = torch.empty(rows, keep, device=scores.device, dtype=torch.int64)
+    listed = torch.empty(rows, device=scores.device, dtype=torch.int32)
+    if rows == 0 or keep == 0:
+        return out, listed.fill_(keep)
+    listing_room, spare = room(width, keep)
+    compiled_scored_pick()(
+        scores, candidates, lengths, out, listed, listing_room, (CuteBeam.FIXED_WORDS + width + spare) * 4
+    )
+    return out, listed
+
+
+def shape_arguments(
+    index_queries: torch.Tensor, shapes: tuple[torch.Tensor, torch.Tensor, torch.Tensor, float] | None
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
+    """Return what a shaped level's spread reads, laid out as the kernel reads it, or stand-ins nothing reads, left unwritten.
+
+    Args:
+        index_queries: Index queries [S, 64] bf16.
+        shapes: The closed node buckets' basis, variances and floors, and their deviations - or None.
+
+    Returns:
+        The sign words [N, SHAPE_RANK * 2] int32, variances [N, SHAPE_RANK] fp32, floors [N] fp32, the queries'
+        bit-planes [S, QUERY_BITS * 2] int32, their level step and total [S, 2] fp32, and the deviations.
+    """
+    rows, device = index_queries.shape[0], index_queries.device
+    if shapes is None:
+        # Nothing reads them, and a fill of each would be five launches a level in a graph
+        return (
+            torch.empty(1, ShapedRead.RANK * ShapedRead.WORDS, device=device, dtype=torch.int32),
+            torch.empty(1, ShapedRead.RANK, device=device),
+            torch.empty(1, device=device),
+            torch.empty(rows, ShapedRead.QUERY_BITS * ShapedRead.WORDS, device=device, dtype=torch.int32),
+            torch.empty(rows, 2, device=device),
+            0.0,
+        )
+    basis, variances, floor, deviations = shapes
+    planes = sign_query(index_queries)
+    words = (
+        basis_words(basis).view(-1, ShapedRead.RANK * ShapedRead.WORDS)
+        if basis.numel()
+        else torch.zeros(1, ShapedRead.RANK * ShapedRead.WORDS, device=device, dtype=torch.int32)
+    )
+    query_terms = torch.stack([planes.steps[:, 0], planes.totals], dim=1)
+    return (
+        words,
+        variances.contiguous(),
+        floor.contiguous(),
+        planes.planes.view(rows, ShapedRead.QUERY_BITS * ShapedRead.WORDS),
+        query_terms,
+        deviations,
+    )
+
+
+def supports_keep(index_queries: torch.Tensor, width: int, keep: int) -> bool:
+    """Tell whether the CuTeDSL keep takes a start level's rows - 64-dim bf16 queries, and a row and its kept that fit.
+
+    Args:
+        index_queries: Index queries [S, index_dim].
+        width: Columns a query's row of scores holds.
+        keep: Columns a query keeps.
+    """
+    return (
+        index_queries.shape[1] == Index.DIM
+        and index_queries.dtype == torch.bfloat16
+        and width + room(width, keep)[1] <= CuteBeam.SHARED_WORDS
+    )
+
+
+def keep_start_level(
+    index_queries: torch.Tensor, scores: torch.Tensor, children: torch.Tensor, keep: int
+) -> torch.Tensor:
+    """Keep each query's best `keep` columns of a start level's scores, and name their children.
+
+    The level's scores are in hand - every node bucket's, shaped or not - so the kernel only reads them.
+
+    Args:
+        index_queries: Index queries [S, 64] bf16.
+        scores: The level's scores [S, N] fp32.
+        children: Each column's children [N, node_bucket_size] int32.
+        keep: Columns a query keeps, the beam's width.
+
+    Returns:
+        The kept node buckets' children [S, keep * node_bucket_size] int32 - a kept bucket's side by side in column
+        order, -1 where a query kept nothing.
+    """
+    # A row this wide stages too much for a second CTA on an SM
+    # => it is listed first, and only its listing is searched
+    staged_bytes = 4 * (CuteBeam.FIXED_WORDS + scores.shape[1] + room(scores.shape[1], keep)[1])
+    if 2 * staged_bytes > CuteBeam.SHARED_BYTES and cutedsl_keep.supports(scores, children, keep):
+        return cutedsl_keep.keep_start_level_listed(scores, children, keep)
+    carried = torch.empty(len(index_queries), 0, device=index_queries.device, dtype=torch.int32)
+    # No carried row names one, but CuTe wants a tensor
+    centroids = torch.zeros(1, Index.DIM, device=index_queries.device, dtype=torch.bfloat16)
+    return beam_step(index_queries, scores, children, carried, centroids, children, keep, 1.0)
+
+
+def compiled_pick(element_bytes: int, threads: int) -> Any:
+    """Return the last level compiled once a centroid precision and thread count, taking torch tensors as they are.
+
+    Args:
+        element_bytes: Bytes a centroid entry takes - 1 for fp8, 2 for bf16.
+        threads: Threads of a CTA.
+    """
+    key = (element_bytes, threads)
+    if key in COMPILED_PICKS:
+        return COMPILED_PICKS[key]
+    rows, open_count, carried_count, centroid_count, page_count, width = (cute.sym_int32() for _ in range(6))
+    query_stride, score_stride, carried_stride, out_stride = (cute.sym_int64() for _ in range(4))
+    centroid_type = cutlass.Float8E4M3FN if element_bytes == 1 else cutlass.BFloat16
+    arguments = (
+        make_fake_tensor(cutlass.BFloat16, (rows, Index.DIM), stride=(query_stride, 1), assumed_align=16),
+        make_fake_tensor(cutlass.Float32, (rows, open_count), stride=(score_stride, 1), assumed_align=4),
+        make_fake_tensor(cutlass.Int32, (rows, carried_count), stride=(carried_stride, 1), assumed_align=4),
+        make_fake_compact_tensor(
+            centroid_type, (centroid_count, Index.DIM), stride_order=(1, 0), assumed_align=16
+        ),
+        make_fake_compact_tensor(cutlass.Int32, (page_count,), assumed_align=4),
+        make_fake_tensor(cutlass.Int64, (rows, width), stride=(out_stride, 1), assumed_align=8),
+        cutlass.Int32(1),
+        cutlass.Int32(1),
+        cutlass.Int32(1),
+        cutlass.Int32(1),
+        cutlass.Int32(1),
+        make_fake_stream(use_tvm_ffi_env_stream=True),
+    )
+    COMPILED_PICKS[key] = cute.compile(
+        TopPPick(element_bytes, threads), *arguments, options="--enable-tvm-ffi"
+    )
+    return COMPILED_PICKS[key]
+
+
+def pick_top_p(
+    index_queries: torch.Tensor,
+    open_scores: torch.Tensor,
+    carried: torch.Tensor | None,
+    centroids: torch.Tensor,
+    pages: torch.Tensor,
+    covered_buckets: int,
+    page_rows: int,
+    top_p: int,
+) -> torch.Tensor:
+    """Pick each query's best `top_p` of its uncovered buckets and the last beam's children, keyed by their cache rows.
+
+    Args:
+        index_queries: Index queries [S, 64] bf16.
+        open_scores: The uncovered buckets' scores [S, open] fp32, -inf past a query's visible count.
+        carried: The cache rows the last beam kept [S, C] int32, -1 for none, or None.
+        centroids: The bucket centroids [rows, 64] bf16 the carried rows name.
+        pages: The request's pages [max_pages] int32.
+        covered_buckets: Buckets under a node bucket - the first uncovered bucket.
+        page_rows: Cache rows a page holds.
+        top_p: Buckets a query picks.
+
+    Returns:
+        The picked buckets' scores packed with their cache rows [S, W] int64 in column order, W the lesser of the row's
+        width and the top-p - the empty key for a column scored -inf or with no row.
+
+    Raises:
+        ValueError: The rows are not ones the kernel takes.
+    """
+    rows = index_queries.shape[0]
+    if carried is None:
+        carried = torch.empty(rows, 0, device=index_queries.device, dtype=torch.int32)
+    open_count = open_scores.shape[1]
+    width = open_count + carried.shape[1]
+    keep = min(top_p, width)
+    if not supports(index_queries, centroids, carried, open_count, keep):
+        raise ValueError(
+            "the CuTeDSL pick takes bf16 index queries of 64 dims over contiguous fp8 or bf16 centroids, and a row "
+            f"and its kept within {CuteBeam.SHARED_WORDS} words - got {index_queries.dtype} {tuple(index_queries.shape)}, "
+            f"{centroids.dtype} {tuple(centroids.shape)} and {open_count} + {carried.shape[1]} columns"
+        )
+    out = torch.empty(rows, keep, device=index_queries.device, dtype=torch.int64)
+    if rows == 0 or keep == 0:
+        return out
+    if open_count == 0:
+        # Nothing reads them, but CuTe wants a tensor
+        open_scores = torch.empty(rows, 1, device=index_queries.device)
+    listing_room, spare = room(width, keep)
+    compiled_pick(centroids.element_size(), CuteBeam.READING_THREADS)(
+        index_queries.contiguous(),
+        open_scores,
+        carried,
+        centroids,
+        pages,
+        out,
+        open_count,
+        covered_buckets,
+        page_rows,
+        listing_room,
+        (CuteBeam.FIXED_WORDS + width + spare) * 4,
+    )
+    return out
