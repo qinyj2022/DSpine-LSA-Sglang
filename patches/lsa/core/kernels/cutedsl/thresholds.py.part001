@@ -1,0 +1,226 @@
+1, 1),
+            block=[CuteThresholds.THREADS, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        bests: cute.Tensor,
+        counts: cute.Tensor,
+        prepared: cute.Tensor,
+        norms: cute.Tensor,
+        thresholds: cute.Tensor,
+        rank: cutlass.Int32,
+    ) -> None:
+        """Take a row's top bin the rank reaches and its edge less Triton's slack, then reset the row's words.
+
+        Args:
+            bests: Each row's best score.
+            counts: Each row's histogram.
+            prepared: Each row's mean, bin width reciprocal, least counted score and bin width.
+            norms: Each index query's norm.
+            thresholds: Each row's threshold.
+            rank: Samples at or above the threshold's bin a row wants.
+        """
+        thread, _, _ = cute.arch.thread_idx()
+        block, _, _ = cute.arch.block_idx()
+        lane = cute.arch.lane_idx()
+        row = block * CuteThresholds.WARPS + thread // 32
+        if row < thresholds.shape[0]:
+            # Lane l holds bins 63 - 2 l and 62 - 2 l, so the lanes in order count down from the top bin
+            high_bin = ThresholdEstimate.BINS - 1 - 2 * lane
+            high = counts[row, high_bin]
+            low = counts[row, high_bin - 1]
+            counts[row, high_bin] = cutlass.Int32(0)
+            counts[row, high_bin - 1] = cutlass.Int32(0)
+            inclusive = high + low
+            for i in cutlass.range_constexpr(5):
+                other = cute.arch.shuffle_sync_up(inclusive, 1 << i, mask_and_clamp=0)
+                if lane >= (1 << i):
+                    inclusive = inclusive + other
+            # The first bin is never counted
+            reached_high = cute.arch.vote_ballot_sync(inclusive - low >= rank)
+            reached_low = cute.arch.vote_ballot_sync((inclusive >= rank) & (lane < 31))
+            reached = cutlass.Int32(reached_high | reached_low)
+            top = cutlass.Int32(0)
+            if reached != 0:
+                first = cutlass.Int32(cute.arch.popc((reached & -reached) - 1))
+                top = ThresholdEstimate.BINS - 1 - 2 * first
+                if (cutlass.Int32(reached_high) >> first) & 1 == 0:
+                    top = top - 1
+            # -inf where no bin above the first reaches the rank
+            threshold = -cutlass.Float32.inf
+            if top > 0:
+                edge = cute.math.fma(prepared[row, 3], cutlass.Float32(top), prepared[row, 0])
+                threshold = cute.math.fma(norms[row], cutlass.Float32(-ThresholdEstimate.EDGE_SLACK), edge)
+            if lane == 0:
+                thresholds[row] = threshold
+                bests[row] = -cutlass.Float32.inf
+
+
+class Workspace:
+    """A device's per-row words - the maxima and bins each call leaves as it found them."""
+
+    def __init__(self, rows: int, device: torch.device) -> None:
+        """Allocate the words for rows rows, clean.
+
+        Args:
+            rows: Rows the words cover, a multiple of 128.
+            device: The device.
+        """
+        self.bests = torch.full((rows,), -torch.inf, device=device)
+        self.group_maxima = torch.full((rows, CuteThresholds.GROUPS), -torch.inf, device=device)
+        self.counts = torch.zeros(rows, ThresholdEstimate.BINS, device=device, dtype=torch.int32)
+
+
+WORKSPACES: dict[torch.device, Workspace] = {}
+COMPILED: dict[tuple[str, bool], Any] = {}
+
+
+def workspace_for(rows: int, device: torch.device) -> Workspace:
+    """Return the device's workspace, grown to cover rows rows.
+
+    Args:
+        rows: Rows the call covers, a multiple of 128.
+        device: The device.
+    """
+    if device not in WORKSPACES or WORKSPACES[device].bests.shape[0] < rows:
+        WORKSPACES[device] = Workspace(rows, device)
+    return WORKSPACES[device]
+
+
+def compiled(name: str, four_wide: bool) -> Any:
+    """Return a launch compiled once for any rows, centroids and blocks, taking torch tensors as they are.
+
+    Args:
+        name: The launch - `sums`, `histogram` or `threshold`.
+        four_wide: The order Triton adds a thread's columns in.
+    """
+    key = (name, four_wide)
+    if key in COMPILED:
+        return COMPILED[key]
+    rows, centroid_count, padded, blocks = (
+        cute.sym_int32(),
+        cute.sym_int32(),
+        cute.sym_int32(),
+        cute.sym_int32(),
+    )
+    stream = make_fake_stream(use_tvm_ffi_env_stream=True)
+    warp_sums = make_fake_compact_tensor(
+        cutlass.Float32, (padded, blocks, 4), stride_order=(2, 1, 0), assumed_align=4
+    )
+    bests = make_fake_compact_tensor(cutlass.Float32, (padded,), assumed_align=4)
+    group_maxima = make_fake_compact_tensor(
+        cutlass.Float32, (padded, CuteThresholds.GROUPS), stride_order=(1, 0), assumed_align=4
+    )
+    counts = make_fake_compact_tensor(
+        cutlass.Int32, (padded, ThresholdEstimate.BINS), stride_order=(1, 0), assumed_align=4
+    )
+    visible_counts = make_fake_compact_tensor(cutlass.Int32, (rows,), assumed_align=4)
+    prepared = make_fake_compact_tensor(cutlass.Float32, (padded, 4), stride_order=(1, 0), assumed_align=16)
+    scalars = (cutlass.Int32(1), cutlass.Int32(1), cutlass.Int32(1))
+    arguments: tuple[Any, ...]
+    kernel: Any
+    if name == "threshold":
+        norms = make_fake_compact_tensor(cutlass.Float32, (rows,), assumed_align=4)
+        thresholds = make_fake_compact_tensor(cutlass.Float32, (rows,), assumed_align=4)
+        arguments = (bests, counts, prepared, norms, thresholds, scalars[0], stream)
+        kernel = Threshold()
+    elif name == "prepare":
+        arguments = (
+            warp_sums,
+            bests,
+            group_maxima,
+            visible_counts,
+            prepared,
+            *scalars,
+            cutlass.Int32(1),
+            stream,
+        )
+        kernel = Prepare()
+    else:
+        queries = make_fake_compact_tensor(
+            cutlass.BFloat16, (rows, Index.DIM), stride_order=(1, 0), assumed_align=16
+        )
+        centroids = make_fake_compact_tensor(
+            cutlass.BFloat16, (centroid_count, Index.DIM), stride_order=(1, 0), assumed_align=16
+        )
+        arguments = (
+            queries,
+            centroids,
+            visible_counts,
+            warp_sums,
+            bests,
+            group_maxima,
+            counts,
+            prepared,
+            *scalars[:2],
+            stream,
+        )
+        kernel = SamplePass(name == "histogram", four_wide)
+    COMPILED[key] = cute.compile(kernel, *arguments, options="--enable-tvm-ffi")
+    return COMPILED[key]
+
+
+def sample_thresholds(
+    index_queries: torch.Tensor,
+    bucket_centroids: torch.Tensor,
+    visible_counts: torch.Tensor,
+    stride: int,
+    rank: int,
+) -> torch.Tensor:
+    """Estimate each row's score at its rank among every stride-th bucket it sees - the Triton thresholds, bit for bit.
+
+    Args:
+        index_queries: Index queries [R, 64] bf16.
+        bucket_centroids: Bucket centroids [N, 64] bf16 of unit rows.
+        visible_counts: Buckets each row sees [R] int32, at most N.
+        stride: Buckets between two samples.
+        rank: Samples at or above the threshold's bin a row wants.
+
+    Returns:
+        Estimated scores [R] fp32, -inf for a row seeing too few to rank.
+
+    Raises:
+        ValueError: The rows are not ones the kernel takes.
+    """
+    if not supports(index_queries, bucket_centroids):
+        raise ValueError(
+            "the CuTeDSL thresholds take bf16 index queries and centroids of 64 dims, and a centroid at least - got "
+            f"{index_queries.dtype} {tuple(index_queries.shape)} and {bucket_centroids.dtype} "
+            f"{tuple(bucket_centroids.shape)}"
+        )
+    rows = index_queries.shape[0]
+    device = index_queries.device
+    sample_count = -(-bucket_centroids.shape[0] // stride)
+    four_wide = sample_count % 16 == 0
+    padded = -(-rows // CuteThresholds.ROWS) * CuteThresholds.ROWS
+    words = workspace_for(padded, device)
+    bests, group_maxima, counts = words.bests[:padded], words.group_maxima[:padded], words.counts[:padded]
+    warp_sums = torch.empty(padded, -(-sample_count // ThresholdEstimate.BLOCK), 4, device=device)
+    thresholds = torch.empty(rows, device=device)
+    norms = index_queries.float().norm(dim=1)
+    queries, centroids = index_queries.contiguous(), bucket_centroids.contiguous()
+    # The rank-th greatest of the group maxima has rank scores at or above it, so it bounds no rank past the groups
+    floored = int(rank <= CuteThresholds.GROUPS)
+    prepared = torch.empty(padded, 4, device=device)
+    passes = (
+        queries,
+        centroids,
+        visible_counts,
+        warp_sums,
+        bests,
+        group_maxima,
+        counts,
+        prepared,
+        stride,
+        sample_count,
+    )
+    compiled("sums", four_wide)(*passes)
+    compiled("prepare", False)(
+        warp_sums, bests, group_maxima, visible_counts, prepared, stride, sample_count, rank, floored
+    )
+    compiled("histogram", four_wide)(*passes)
+    compiled("threshold", False)(bests, counts, prepared, norms, thresholds, rank)
+    return thresholds
