@@ -1,0 +1,307 @@
+lass.Int32, (rows,), assumed_align=4),
+        make_fake_tensor(cutlass.Int32, (slot_requests, context), stride=(slot_stride, 1), assumed_align=4),
+        make_fake_compact_tensor(cutlass.Int32, (rows, width), stride_order=(1, 0), assumed_align=4),
+        cutlass.Int32(1),
+        cutlass.Int32(1),
+        make_fake_stream(use_tvm_ffi_env_stream=True),
+    )
+    kernel = ExpansionByThreshold(
+        capacity, bucket_cap, top_p, top_k, window_size, sink_size, map_slots, physical, threads, early
+    )
+    COMPILED[key] = cute.compile(kernel, *arguments, options="--enable-tvm-ffi")
+    return COMPILED[key]
+
+
+@functools.cache
+def multiprocessors_of(index: int) -> int:
+    """Return the multiprocessors of a CUDA device, asked once.
+
+    Args:
+        index: The device's index.
+
+    Returns:
+        The device's multiprocessor count.
+    """
+    return torch.cuda.get_device_properties(index).multi_processor_count
+
+
+def multiprocessors(device: torch.device) -> int:
+    """Return the multiprocessors of a device.
+
+    Args:
+        device: A CUDA device, whose index may be None for the current one.
+
+    Returns:
+        The device's multiprocessor count.
+    """
+    return multiprocessors_of(torch.cuda.current_device() if device.index is None else device.index)
+
+
+def threads_for(rows: int, device: torch.device) -> int:
+    """Return the threads of a CTA for a launch of rows.
+
+    Args:
+        rows: Rows the launch has, a CTA each.
+        device: The device the launch runs on.
+
+    Returns:
+        FEW_ROWS_THREADS when the rows leave SMs idle, MANY_ROWS_THREADS otherwise.
+    """
+    return (
+        CuteExpansion.FEW_ROWS_THREADS
+        if rows <= CuteExpansion.ROWS_PER_SM * multiprocessors(device)
+        else CuteExpansion.MANY_ROWS_THREADS
+    )
+
+
+def stand_in(device: torch.device) -> torch.Tensor:
+    """Return a one-entry int32 table for an argument a read does not take.
+
+    Args:
+        device: The device.
+    """
+    if device not in STAND_INS:
+        STAND_INS[device] = torch.zeros(1, 1, device=device, dtype=torch.int32)
+    return STAND_INS[device]
+
+
+def supports(keys: torch.Tensor, bucket_members: torch.Tensor, request_pages: torch.Tensor) -> bool:
+    """Tell whether the CuTeDSL fill takes this listing - int64 keys, int32 tables, contiguous rows and a cap of 2^n to 32.
+
+    Args:
+        keys: Listed packed keys [R, C].
+        bucket_members: Members of each cache row [rows, bucket_cap].
+        request_pages: Pages of each request [requests, pages].
+    """
+    return (
+        keys.dtype == torch.int64
+        and keys.stride(1) == 1
+        and bucket_members.shape[1] in (1, 2, 4, 8, 16, 32)
+        and bucket_members.dtype == torch.int32
+        and bucket_members.is_contiguous()
+        and request_pages.dtype == torch.int32
+        and request_pages.stride(1) == 1
+    )
+
+
+def expand_by_threshold(
+    keys: torch.Tensor,
+    listed: torch.Tensor,
+    bucket_members: torch.Tensor,
+    bucket_sizes: torch.Tensor,
+    request_pages: torch.Tensor,
+    request_rows: torch.Tensor,
+    positions: torch.Tensor,
+    rows_per_page: int,
+    cluster_block_size: int,
+    top_p: int,
+    window_size: int,
+    sink_size: int,
+    top_k: int,
+    slot_table: torch.Tensor | None = None,
+    page_positions: torch.Tensor | None = None,
+    early: EarlyBudget | None = None,
+    threads: int | None = None,
+) -> torch.Tensor:
+    """Fill each row's read from its listed buckets by the key a best-first walk of its top-p stops at.
+
+    Args:
+        keys: Listed packed keys [R, C] int64, the empty key after a row's listed count.
+        listed: Keys each row listed [R] int32, at most C.
+        bucket_members: Members of each cache row [rows, bucket_cap] int32, -1 padded.
+        bucket_sizes: Members of each cache row [rows] int32.
+        request_pages: Pages of each request [requests, pages] int32, read through a request's logical buckets.
+        request_rows: Each row's request [R] int64.
+        positions: Each row's position [R] int32.
+        rows_per_page: Cache rows a page holds.
+        cluster_block_size: Positions a cluster block covers.
+        top_p: Best buckets the walk reads at most.
+        window_size: Recent positions read whole.
+        sink_size: First positions read whole.
+        top_k: Bucket members read at most.
+        slot_table: Each request's positions to KV slots [requests, context] int32 - positions when None.
+        page_positions: Each page's first position [pages] int32 - when given, the keys hold cache rows rather than
+            a request's logical buckets, and `request_pages` is not read.
+        early: The budget of rows before its position, whose walk stops at the key its `top_p` and `top_k` find in a
+            listing that holds every such row's top-p - or None for `top_p` and `top_k` throughout.
+        threads: Threads of a CTA, or None for the count the rows call for.
+
+    Returns:
+        Read lists [R, top_k + window_size + sink_size] int32, -1 padded.
+
+    Raises:
+        ValueError: The listing is not one the kernel takes.
+    """
+    if not supports(keys, bucket_members, request_pages):
+        raise ValueError(
+            "the CuTeDSL fill takes int64 keys, int32 tables with contiguous rows and a bucket cap of a power of two up "
+            "to 32 - got keys "
+            f"{keys.dtype} strides {keys.stride()}, members {bucket_members.dtype} and pages {request_pages.dtype} "
+            f"strides {request_pages.stride()}"
+        )
+    device = keys.device
+    threads = threads_for(keys.shape[0], device) if threads is None else threads
+    out = torch.empty(keys.shape[0], top_k + window_size + sink_size, device=device, dtype=torch.int32)
+    fill = compiled(
+        keys.shape[1],
+        bucket_members.shape[1],
+        top_p,
+        top_k,
+        window_size,
+        sink_size,
+        slot_table is not None,
+        page_positions is not None,
+        threads,
+        early,
+    )
+    fill(
+        keys,
+        listed,
+        bucket_members,
+        bucket_sizes,
+        request_pages,
+        stand_in(device)[0] if page_positions is None else page_positions,
+        request_rows,
+        positions,
+        stand_in(device) if slot_table is None else slot_table,
+        out,
+        rows_per_page,
+        cluster_block_size,
+    )
+    return out
+
+
+def compiled_rank_order(
+    top_p: int,
+    bucket_cap: int,
+    top_k: int,
+    window_size: int,
+    sink_size: int,
+    map_slots: bool,
+    threads: int,
+    early: EarlyBudget | None = None,
+) -> Any:
+    """Return the expansion in rank order compiled once for its shapes and form, taking torch tensors as they are.
+
+    Args:
+        top_p: Picks a row has.
+        bucket_cap: Members a cache row holds at most.
+        top_k: Bucket members read at most.
+        window_size: Recent positions read whole.
+        sink_size: First positions read whole.
+        map_slots: Write KV slots through the slot table.
+        threads: Threads of a CTA.
+        early: The budget of rows before its position, or None.
+    """
+    key = (top_p, bucket_cap, top_k, window_size, sink_size, int(map_slots), threads, early)
+    if key in COMPILED_IN_ORDER:
+        return COMPILED_IN_ORDER[key]
+    rows, cache_rows, slot_requests, context, slot_row_count = (cute.sym_int32() for _ in range(5))
+    selected_stride, slot_stride = cute.sym_int64(), cute.sym_int64()
+    width = top_k + window_size + sink_size
+    arguments = (
+        make_fake_tensor(cutlass.Int32, (rows, top_p), stride=(selected_stride, 1), assumed_align=4),
+        # A member row is as aligned as its bytes, to 16, so a pick's row loads in vectors
+        make_fake_compact_tensor(
+            cutlass.Int32,
+            (cache_rows, bucket_cap),
+            stride_order=(1, 0),
+            assumed_align=min(16, 4 * bucket_cap),
+        ),
+        make_fake_compact_tensor(cutlass.Int32, (rows,), assumed_align=4),
+        make_fake_tensor(cutlass.Int32, (slot_requests, context), stride=(slot_stride, 1), assumed_align=4),
+        make_fake_compact_tensor(cutlass.Int64, (slot_row_count,), assumed_align=8),
+        make_fake_compact_tensor(cutlass.Int32, (rows, width), stride_order=(1, 0), assumed_align=4),
+        make_fake_compact_tensor(cutlass.Int32, (rows,), assumed_align=4),
+        make_fake_stream(use_tvm_ffi_env_stream=True),
+    )
+    kernel = ExpansionInRankOrder(top_p, bucket_cap, top_k, window_size, sink_size, map_slots, threads, early)
+    COMPILED_IN_ORDER[key] = cute.compile(kernel, *arguments, options="--enable-tvm-ffi")
+    return COMPILED_IN_ORDER[key]
+
+
+def supports_rank_order(selected: torch.Tensor, bucket_members: torch.Tensor) -> bool:
+    """Tell whether the CuTeDSL expansion in rank order takes these picks - int32, contiguous rows, a cap of 2^n to 32.
+
+    Args:
+        selected: Picked cache rows [R, top_p].
+        bucket_members: Members of each cache row [rows, bucket_cap].
+    """
+    return (
+        selected.dtype == torch.int32
+        and selected.stride(1) == 1
+        and bucket_members.shape[1] in (1, 2, 4, 8, 16, 32)
+        and bucket_members.dtype == torch.int32
+        and bucket_members.is_contiguous()
+        # A pick's place and its first entry share one word
+        and selected.shape[1] * bucket_members.shape[1] < CuteExpansion.WALKED
+    )
+
+
+def expand_in_order(
+    selected: torch.Tensor,
+    bucket_members: torch.Tensor,
+    positions: torch.Tensor,
+    window_size: int,
+    sink_size: int,
+    top_k: int,
+    slot_table: torch.Tensor | None = None,
+    slot_rows: torch.Tensor | None = None,
+    early: EarlyBudget | None = None,
+    threads: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Read each row's picked buckets best first until the top-k is full, then the window and the sinks.
+
+    Args:
+        selected: Picked cache rows [R, top_p] int32, best score first, -1 padded.
+        bucket_members: Members of each cache row [rows, bucket_cap] int32, -1 padded.
+        positions: Each row's position [R] int32.
+        window_size: Recent positions read whole.
+        sink_size: First positions read whole.
+        top_k: Bucket members read at most.
+        slot_table: Each request's positions to KV slots [requests, context] int32 - positions when None.
+        slot_rows: Each row's request [R] int64, read with `slot_table`.
+        early: The budget of rows before its position - they read its first `top_p` picks up to its `top_k` - or
+            None for every pick up to `top_k` throughout.
+        threads: Threads of a CTA, or None for the count the rows call for.
+
+    Returns:
+        Read lists [R, top_k + window_size + sink_size] int32, -1 padded, the expansion first.
+        Entries each read list holds [R] int32.
+
+    Raises:
+        ValueError: The picks are not ones the kernel takes.
+    """
+    if not supports_rank_order(selected, bucket_members):
+        raise ValueError(
+            "the CuTeDSL expansion in rank order takes int32 picks and members with contiguous rows, a bucket cap of a power "
+            f"of two up to 32 and fewer than {CuteExpansion.WALKED} members a row - got picks {selected.dtype} "
+            f"{tuple(selected.shape)} strides {selected.stride()} and members {bucket_members.dtype} "
+            f"{tuple(bucket_members.shape)}"
+        )
+    device = selected.device
+    rows = selected.shape[0]
+    out = torch.empty(rows, top_k + window_size + sink_size, device=device, dtype=torch.int32)
+    lengths = torch.empty(rows, device=device, dtype=torch.int32)
+    if rows == 0:
+        return out, lengths
+    read = compiled_rank_order(
+        selected.shape[1],
+        bucket_members.shape[1],
+        top_k,
+        window_size,
+        sink_size,
+        slot_table is not None,
+        threads_for(rows, device) if threads is None else threads,
+        early,
+    )
+    read(
+        selected,
+        bucket_members,
+        positions.int().contiguous(),
+        stand_in(device) if slot_table is None else slot_table,
+        positions.new_zeros(1, dtype=torch.int64) if slot_rows is None else slot_rows.contiguous(),
+        out,
+        lengths,
+    )
+    return out, lengths
