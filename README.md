@@ -1,7 +1,7 @@
 # DSpine + LSA on SGLang
 
 在 **Qwen3.8-27B（混合线性注意力，64 层 = 48 GDN + 16 full-attn）** 上，把两种互不相干的推理加速技术同时跑通并量化：
-
+适用于RTX 40x0， 30x0系列，pro 6000,5000等硬件
 - **DSpine**（Tencent，Apache-2.0）— 并行草稿投机解码，一次前向出 16 个草稿 token
 - **LSA**（Prefrontal-AI/latent-sparse-attention，Apache-2.0）— 稀疏注意力索引，把长上下文注意力代价钉死在 `top_k`
 - 承载在 **SGLang 0.5.22** 上，GPU 为 RTX PRO 6000 （sm120，97,887 MiB）
